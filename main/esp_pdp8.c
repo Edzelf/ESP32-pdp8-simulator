@@ -1,19 +1,20 @@
-//***************************************************************************************************
-//*					PDP8 simulator for ESP32.														*
-//*					By Ed Smallenburg, august 2017.													*
-//***************************************************************************************************
-//* Uses wear-leveling library for simulation of storage devices like RK08, DECtape.				*
-//* Communications is handled trough a Telnet session (client like PuTTY).							*
-//* Note that bitnumber in the comments refer to the PDP numbering scheme:							*
-//*     0  1  2  3  4  5  6  7  8  9 10 11															*
-//*   +--+--+--+--+--+--+--+--+--+--+--+--+															*
-//*   | opcode |     o p e r a n d        |															*
-//*   +--+--+--+--+--+--+--+--+--+--+--+--+															*
-//* The interrupt system is not implemented.														*
-//***************************************************************************************************
-// Version history:																					*
-// 26-AUG-2017, ES	First set-up																	*
-//***************************************************************************************************
+//***********************************************************************************************
+//*					PDP8 simulator for ESP32.													*
+//*					By Ed Smallenburg, august 2017.												*
+//***********************************************************************************************
+//* Uses wear-leveling library for simulation of storage devices like RK08, DECtape.			*
+//* Communications is handled trough a Telnet session (client like PuTTY).						*
+//* Note that bitnumber in the comments refer to the PDP numbering scheme:						*
+//*     0  1  2  3  4  5  6  7  8  9 10 11														*
+//*   +--+--+--+--+--+--+--+--+--+--+--+--+														*
+//*   | opcode |     o p e r a n d        |														*
+//*   +--+--+--+--+--+--+--+--+--+--+--+--+														*
+//* The interrupt system is not implemented.													*
+//***********************************************************************************************
+// Version history:																				*
+// 26-AUG-2017, ES	First set-up																*
+// 04-SEP-2017, ES	Correction keyboard input and fake-drivers.									*
+//***********************************************************************************************
 //
 #include <stdio.h>
 #include <ctype.h>
@@ -138,6 +139,7 @@ uint16_t ddr[SZSYSHND] =
 		//					  //		No return here, driver will return to caller directly
 		/* 7623 */    07402,  //  HND4,	HLT				/ DTA1 handler
 		/* 7624 */    07300,  //		CLA CLL
+		/* 7625 */    01223,  //		TAD HND4		/ POINTER to parameters
 		/* 7626 */    06773,  //		6773			/ SIMULATES DTA1:
 		//					  //		No return here, driver will return to caller directly
 		/* 7627 */    07402,  //  HND5,	HLT				/ RXA0 handler
@@ -180,6 +182,7 @@ int				clientSock = -1 ;						// Client socket
 QueueHandle_t	kbd_queue ;								// Queue for telnet input (keystrokes)
 QueueHandle_t	tls_queue ;								// Queue for telnet output (print)
 uint8_t			kbd_last = 0 ;							// Last character seen
+bool			kbd_flag = false ;						// Character available
 bool			abortf = false ;						// Flag to abort telnet and ESP
 uint16_t		seldev = 5 ;							// Selected device for load/save image
 
@@ -211,17 +214,16 @@ bool kbd_available()
 {
 	uint8_t k ;										// Input from queue
 
-	if ( uxQueueMessagesWaiting ( kbd_queue ) )		// New character arrived?
+	if ( !kbd_flag )								// Software flag set?
 	{
-		xQueueReceive ( kbd_queue, &k, 0 ) ;		// Yes, read the new character
-		if ( k == '\0' )							// NULL character?
+		if ( uxQueueMessagesWaiting ( kbd_queue ) )	// No, new character arrived?
 		{
-			return false ;							// Yes, skip
+			xQueueReceive ( kbd_queue, &k, 0 ) ;	// Yes, read the new character
+			kbd_last = k ;							// Remember as last char
+			kbd_flag = true 	;					// and flag
 		}
-		kbd_last = k ;								// Remember last char
-		return true ;								// Character available
 	}
-	return false ;									// No input ;
+	return kbd_flag ;								// Return the flag
 }
 
 
@@ -235,6 +237,7 @@ uint8_t kbd_input()
 	return kbd_last ;								// Return last read character to caller
 }
 
+
 //***********************************************************************************************
 //									K B D _ C L E A R											*
 //***********************************************************************************************
@@ -242,7 +245,19 @@ uint8_t kbd_input()
 //***********************************************************************************************
 void kbd_clear()
 {
-	// nothing to do
+	kbd_flag = false ;
+}
+
+
+//***********************************************************************************************
+//									K B D _ G E T												*
+//***********************************************************************************************
+// Get the last keyboard input character and clear the ready_flag.								*
+//***********************************************************************************************
+uint8_t kbd_get()
+{
+	kbd_flag = false ;								// Clear flag
+	return kbd_last ;								// Return last read character to caller
 }
 
 
@@ -1138,10 +1153,8 @@ void menu()
 	{
 		if ( kbd_available() )								// Any input?
 		{
-			if ( kbd_input() > 0 )							// Yes, read char and discard
-			{												// Ignore NULL character
-				menu_state = START ;						// State is now START
-			}
+			kbd_get() ;										// Yes, read char and discard
+			menu_state = START ;							// State is now START
 		}
 	}
 	if ( menu_state == START )								// Have to display the menu?
@@ -1172,7 +1185,7 @@ void menu()
 	{
 		if ( kbd_available() )								// Any input?
 		{
-			c = kbd_input() ;								// Yes, read char
+			c = kbd_get() ;									// Yes, read char
 			if ( inx < 2 )									// Command character?
 			{
 				c = toupper ( c ) ;							// Make upper case
@@ -1260,7 +1273,7 @@ void telnet_server ( void *pvParameter )
 	socklen_t			clientAddressLength ;
 	int					sock ;									// Socket for listen
 	int					rc ;									// Result of bind/listen
-	uint8_t				buffer[2] ;								// Char buffer for in/output
+	uint8_t				c ;										// Char buffer for in/output
 	int					n ;										// Nr of chars read from socket
 	bool				idle ;									// True if no activity
 
@@ -1310,21 +1323,21 @@ void telnet_server ( void *pvParameter )
 			idle = true ;										// Assume no activity
 			if ( uxQueueSpacesAvailable ( kbd_queue ) )			// Do we have space for keystrokes?
 			{
-				n = recv ( clientSock, buffer, 1,
+				n = recv ( clientSock, &c, 1,
 						   MSG_DONTWAIT ) ;						// Read 1 character from client, no blocking
 				if ( n > 0 )									// Check for error
 				{
 					idle = false ;								// Activity detected
-					if ( buffer[0] == 01 )						// Ctrl-A ?
+					if ( c == 01 )								// Ctrl-A ?
 					{
 						menu_state = START ;					// Force start of menu
 						ESP_LOGI ( tag,
 								   "Ctrl-A seen" ) ;
 						running = false ;						// Stop PDP8
 					}
-					else
+					else if ( c )								// Skip NULL character
 					{
-						xQueueSend ( kbd_queue, buffer, 0 ) ;	// Send to keyboard queue
+						xQueueSend ( kbd_queue, &c, 0 ) ;		// Send to keyboard queue
 					}
 				}
 				if ( n == 0 )									// 0 means connection closed
@@ -1339,8 +1352,8 @@ void telnet_server ( void *pvParameter )
 			}
 			if ( uxQueueMessagesWaiting ( tls_queue ) )			// Something to send?
 			{
-				xQueueReceive ( tls_queue, buffer, 0 ) ;		// Yes, get next char
-				send ( clientSock, buffer, 1, 0 ) ;				// Sent to telnet client
+				xQueueReceive ( tls_queue, &c, 0 ) ;			// Yes, get next char
+				send ( clientSock, &c, 1, 0 ) ;					// Sent to telnet client
 				idle = false ;									// Activity detected
 			}
 			if ( idle )											// Nothing to do, wait some time
@@ -2068,11 +2081,15 @@ void iot()
 			{
 				PC++ ;
 			}
-		}
-		if ( IR & 02 )									// KCC
-		{
-			AC = ( AC & 010000 ) ;						// Clear AC
-			kbd_clear() ;								// and keyboard flag
+			else
+			{
+				// Delay if "KSF;JMP .-1" is detected, probably most of the time.
+				if ( MEM[IF][PC] == ( 05000 + ( ( PC - 1 ) & 0377 ) ) )
+				{
+					vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;	//  100 msec
+				}
+			}
+			break ;
 		}
 		if ( IR & 04 )									// KRS, read byte and OR into AC
 		{
@@ -2082,6 +2099,10 @@ void iot()
 				c = toupper ( c ) ;						// Yes
 			}
 			AC = ( AC & 010000 ) | c | 0200 ;			// Clear AC, OR character in, set bit 4
+		}
+		if ( IR & 02 )									// KCC
+		{
+			kbd_clear() ;								// and keyboard flag
 		}
 		break ;
 	case 06040 :										// Teleprinter like ASR33
