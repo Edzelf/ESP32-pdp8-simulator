@@ -3,7 +3,7 @@
 //*					By Ed Smallenburg, august 2017.												*
 //***********************************************************************************************
 //* Uses wear-leveling library for simulation of storage devices like RK08, DECtape.			*
-//* Communications is handled trough a Telnet session (client like PuTTY).						*
+//* Communications (TTY simulation) is handled trough a Telnet session (client like PuTTY).		*
 //* Note that bitnumber in the comments refer to the PDP numbering scheme:						*
 //*     0  1  2  3  4  5  6  7  8  9 10 11														*
 //*   +--+--+--+--+--+--+--+--+--+--+--+--+														*
@@ -14,6 +14,7 @@
 // Version history:																				*
 // 26-AUG-2017, ES	First set-up																*
 // 04-SEP-2017, ES	Correction keyboard input and fake-drivers.									*
+// 11-OCT-2017, ES	Correction default date.													*
 //***********************************************************************************************
 //
 #include <stdio.h>
@@ -50,7 +51,7 @@
 #include "driver/sdspi_host.h"
 #include <sys/dirent.h>
 // Port for the telnet server
-#define PORT_NUMBER 23
+#define TELNET_PORT 23
 // Size of RKA0 / RKBO / DECTAPE / FLOPPY / TMP0 in OS/8 blocks
 #define DSKSIZE 3248
 #define TAPESIZE 737
@@ -1285,7 +1286,7 @@ void telnet_server ( void *pvParameter )
 	}
 	serverAddress.sin_family      = AF_INET ;					// Bind our server socket to a port.
 	serverAddress.sin_addr.s_addr = htonl ( INADDR_ANY ) ;
-	serverAddress.sin_port        = htons ( PORT_NUMBER ) ;		// Listen on this port
+	serverAddress.sin_port        = htons ( TELNET_PORT ) ;		// Listen on this port
 	rc  = bind ( sock, (struct sockaddr *)&serverAddress,		// Bind
 			sizeof(serverAddress) ) ;
 	if ( rc < 0 )												// Check result
@@ -1485,28 +1486,24 @@ static void obtain_time ( void )
 	if ( timeinfo.tm_year < ( 2016 - 1900 ) )
 	{
 		timeinfo.tm_year = 2017 ;							// Use default date
-		timeinfo.tm_mon  = 8 ;								// 01-sep-2017
+		timeinfo.tm_mon  = 10 ;								// 01-oct-2017
 		timeinfo.tm_mday = 1 ;
 		ESP_LOGE ( tag, "System time NOT set, "
 				        "default used." ) ;
 	}
-	else
-	{
-		ESP_LOGI ( tag, "Time is set to "
-				"%02d-%02d-%04d - %02d:%02d:%02d",			// Yes, format to a string
-				timeinfo.tm_mday,
-				timeinfo.tm_mon + 1,
-				timeinfo.tm_year + 1900,
-				timeinfo.tm_hour,
-				timeinfo.tm_min,
-				timeinfo.tm_sec ) ;
-		yearbits = timeinfo.tm_year % 100 ;					// Last 2 digits of year
-		os8date = ( ( timeinfo.tm_mon + 1 ) << 8 ) |		// Form OS/8 date
-				  ( timeinfo.tm_mday << 3 ) |
-				  ( yearbits & 07 ) ;					 	// Valid from 2000 to 2037
-		os8datex = ( yearbits & 030 ) << 4 ;				// Extended year bits
-
-	}
+	ESP_LOGI ( tag, "Time is set to "
+			"%02d-%02d-%04d - %02d:%02d:%02d",				// Yes, format to a string
+			timeinfo.tm_mday,
+			timeinfo.tm_mon + 1,
+			timeinfo.tm_year + 1900,
+			timeinfo.tm_hour,
+			timeinfo.tm_min,
+			timeinfo.tm_sec ) ;
+	yearbits = timeinfo.tm_year % 100 ;						// Last 2 digits of year
+	os8date = ( ( timeinfo.tm_mon + 1 ) << 8 ) |			// Form OS/8 date
+			  ( timeinfo.tm_mday << 3 ) |
+			  ( yearbits & 07 ) ;					 		// Valid from 2000 to 2037
+	os8datex = ( yearbits & 030 ) << 4 ;					// Extended year bits
 }
 
 
@@ -1955,6 +1952,7 @@ void iot()
 	case 06000 :
 		switch ( IR )
 		{
+		/*
 		case 06000 :									// SKON, skip if interrupt/turn interrupts off
 			if ( IENA )									// IENA set?
 			{
@@ -1981,6 +1979,7 @@ void iot()
 			{
 				AC |= 02000 ;							// Yes, flag to AC1
 			}
+		*/
 		case 06007 :									// CAF
 			AC = 0 ;									// Clear AC and link
 			break ;										// To do: interrupt flags
