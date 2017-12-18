@@ -24,39 +24,41 @@
 #include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_event_loop.h"
-#include "freertos/event_groups.h"
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
+#include "esp_sleep.h"
+#include "esp_log.h"
+#include "esp_vfs.h"
+#include "esp_vfs_fat.h"
+#include "esp_partition.h"
 #include <time.h>
 #include <sys/time.h>
 #include "lwip/err.h"
 #include "apps/sntp/sntp.h"
-#include "esp_partition.h"
 #include "wear_levelling.h"
 #include <errno.h>
 #include <sys/fcntl.h>
-#include "esp_log.h"
 #include "rom/uart.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
-#include "esp_vfs.h"
-#include "esp_vfs_fat.h"
 #include "driver/sdspi_host.h"
 #include <sys/dirent.h>
+#include <nvs_flash.h>
 // Port for the telnet server
 #define TELNET_PORT 23
 // Size of RKA0 / RKBO / DECTAPE / FLOPPY / TMP0 in OS/8 blocks
 #define DSKSIZE 3248
 #define TAPESIZE 737
 #define FLOPSIZE 494
-#define TMPSIZE  168
+#define TMPSIZE  126
 
 // Global variables
 const char*			tag   = "[PDP8]" ;				// For info/error messages emulator
@@ -185,7 +187,7 @@ QueueHandle_t	tls_queue ;								// Queue for telnet output (print)
 uint8_t			kbd_last = 0 ;							// Last character seen
 bool			kbd_flag = false ;						// Character available
 bool			abortf = false ;						// Flag to abort telnet and ESP
-uint16_t		seldev = 5 ;							// Selected device for load/save image
+uint16_t		seldev = 5 ;							// Selected device (TMP0) for load/save image
 
 enum { START, WAIT_ANY, WAIT_CMD } menu_state = START ;	// State of menu
 
@@ -1423,6 +1425,8 @@ static esp_err_t event_handler ( void *ctx, system_event_t *event )
 //									I N I T I A L I Z E _ W I F I								*
 //***********************************************************************************************
 // Init Wifi connection.																		*
+// Be sure to unselect Wifi nvs enabled in menuconfig, component config -> Wifi ->				*
+// Wifi NVS Flash.																				*
 //***********************************************************************************************
 static void initialize_wifi ( void )
 {
@@ -2405,9 +2409,10 @@ void app_main()
 	TaskHandle_t	th_sim ;								// Task handle for simulator task
 	uint16_t		show_stack = 59 ;						// Counter for showing stack space
 
-	esp_deep_sleep_pd_config ( ESP_PD_DOMAIN_RTC_PERIPH,	// Init deep-sleep mode
+	esp_sleep_pd_config ( ESP_PD_DOMAIN_RTC_PERIPH,			// Init deep-sleep mode
 							   ESP_PD_OPTION_AUTO ) ;
-	esp_deep_sleep_enable_ext0_wakeup ( 0, 0 ) ;			// Wake if GPIO is low
+	esp_sleep_enable_ext0_wakeup ( 0, 0 ) ;					// Wake if GPIO is low
+    nvs_flash_init() ;										// Needed for WiFi init
 	sd_sc_pin = atoi ( CONFIG_SC_CS ) ;						// SD card select pin as integer
 	gpio_pullup_en ( 0 ) ;									// Use pull-up on GPIO 0 (EN)
 	gpio_pulldown_dis ( 0) ;								// Not use pull-down on GPIO 0
@@ -2481,7 +2486,7 @@ void app_main()
 					   "Free stack space main task is      %5d words",
 					   uxTaskGetStackHighWaterMark ( NULL ) ) ;
 			ESP_LOGI ( tag,
-					   "Free heap space (in bytes)is %6d",
+					   "Free heap space is                %6d bytes",
 					   esp_get_free_heap_size() ) ;
 		}
 		if ( instcount )
