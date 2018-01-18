@@ -5,16 +5,18 @@
 //* Uses wear-leveling library for simulation of storage devices like RK08, DECtape.			*
 //* Communications (TTY simulation) is handled trough a Telnet session (client like PuTTY).		*
 //* Note that bitnumber in the comments refer to the PDP numbering scheme:						*
-//*     0  1  2  3  4  5  6  7  8  9 10 11														*
+//*     0  1  2  3  4  5  6  7  8  9 10 11		Example for a memory reference instruction.		*
 //*   +--+--+--+--+--+--+--+--+--+--+--+--+														*
 //*   | opcode |     o p e r a n d        |														*
 //*   +--+--+--+--+--+--+--+--+--+--+--+--+														*
-//* The interrupt system is not implemented.													*
+//* The interrupt system is not yet implemented.												*
 //***********************************************************************************************
 // Version history:																				*
 // 26-AUG-2017, ES	First set-up																*
 // 04-SEP-2017, ES	Correction keyboard input and fake-drivers.									*
 // 11-OCT-2017, ES	Correction default date.													*
+// 15-JAN-2018, ES	Version for ESP module with 0.96 inch OLED and 128 Mbit flash.				*
+// 16-JAN-2018, ES	OTA update of application software.											*
 //***********************************************************************************************
 //
 #include <stdio.h>
@@ -36,6 +38,8 @@
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
 #include "esp_partition.h"
+#include "esp_ota_ops.h"
+#include "nvs_flash.h"
 #include <time.h>
 #include <sys/time.h>
 #include "lwip/err.h"
@@ -52,6 +56,13 @@
 #include "driver/sdspi_host.h"
 #include <sys/dirent.h>
 #include <nvs_flash.h>
+
+// If OLED is defined (in menuconfig), a life front panel is simulated (I2C).
+#ifdef CONFIG_OLED
+  #include "ssd1306.h"
+  #include "driver/i2c.h"
+#endif
+
 // Port for the telnet server
 #define TELNET_PORT 23
 // Size of RKA0 / RKBO / DECTAPE / FLOPPY / TMP0 in OS/8 blocks
@@ -61,12 +72,19 @@
 #define TMPSIZE  126
 
 // Global variables
-const char*			tag   = "[PDP8]" ;				// For info/error messages emulator
-struct tm			timeinfo = { 0 } ;				// Current time
-EventGroupHandle_t	wifi_event_group ;				// FreeRTOS event group for WiFi connect
-uint16_t			wrdbuf[256] ;					// Buffer for 256 PDP8 words from download
-uint16_t			os8date ;						// Date in OS/8 form mmmmdddddyyy
-uint16_t			os8datex ;						// Extended year bits yy0000000
+const char*			tag   = "[PDP8]" ;					// For info/error messages emulator
+struct tm			timeinfo = { 0 } ;					// Current time
+TaskHandle_t		th_telnet ;							// Task handle for telnet task
+TaskHandle_t		th_sim ;							// Task handle for simulator task
+#ifdef CONFIG_OLED
+  TaskHandle_t		th_console ;						// Task handle for console task
+#endif
+
+EventGroupHandle_t	wifi_event_group ;					// FreeRTOS event group for WiFi connect
+uint16_t			wrdbuf[256] ;						// Buffer for 256 PDP8 words from download
+uint16_t			os8date ;							// Date in OS/8 form mmmmdddddyyy
+uint16_t			os8datex ;							// Extended year bits yy0000000
+ip4_addr_t			ip_Addr ;							// IP address of STA
 
 // The event group allows multiple bits for each event, but we only care about one event:
 // are we connected to the AP with an IP?
@@ -75,6 +93,8 @@ const int			CONNECTED_BIT = 0x00000001 ;
 // Variables for emulator.
 uint16_t PC = 07600 ;									// Program counter
 uint16_t AC = 0 ;										// Accumulator
+uint16_t MA = 0 ;										// Memory address buffer
+uint16_t MB = 0 ;										// Memory buffer
 uint16_t MQ = 0 ;										// Multiplier/Quotient register
 uint16_t IR = 0 ;										// Instruction register (=MEM[IF][PC])
 uint16_t SR = 07600 ;									// Switch register
@@ -122,7 +142,7 @@ uint32_t   atime = 0 ;									// Serial for detection of least recently used
 
 // Simulated driver for RKA0 Starts at 07607.  This is a copy of the fake handler. It does not harm an
 // OS/8 with the fake handler installed, but it is vital to boot a system without it.
-#define SZSYSHND 24										// Max. 135 octal locations
+#define SZSYSHND 32										// 10 handlers, max. 135 octal locations
 uint16_t ddr[SZSYSHND] =
 {
 		/* 7607 */    07402,  //  HND1,	HLT				/ SYS and RKA0 handler
@@ -135,30 +155,40 @@ uint16_t ddr[SZSYSHND] =
 		/* 7615 */    01213,  //		TAD HND2		/ POINTER to parameters
 		/* 7616 */    06771,  //		6771			/ SIMULATES RKB0:
 		//					  //		No return here, driver will return to caller directly
-		/* 7617 */    07402,  //  HND3,	HLT				/ DTA0 handler
+		/* 7617 */    07402,  //  HND3,	HLT				/ RKA1 handler
 		/* 7620 */    07300,  //		CLA CLL
 		/* 7621 */    01217,  //		TAD HND3		/ POINTER to parameters
-		/* 7622 */    06772,  //		6772			/ SIMULATES DTA0:
+		/* 7622 */    06772,  //		6772			/ SIMULATES RKA1:
 		//					  //		No return here, driver will return to caller directly
-		/* 7623 */    07402,  //  HND4,	HLT				/ DTA1 handler
+		/* 7623 */    07402,  //  HND4,	HLT				/ RKB1 handler
 		/* 7624 */    07300,  //		CLA CLL
 		/* 7625 */    01223,  //		TAD HND4		/ POINTER to parameters
-		/* 7626 */    06773,  //		6773			/ SIMULATES DTA1:
+		/* 7626 */    06773,  //		6773			/ SIMULATES RKB1:
 		//					  //		No return here, driver will return to caller directly
-		/* 7627 */    07402,  //  HND5,	HLT				/ RXA0 handler
+		/* 7627 */    07402,  //  HND5,	HLT				/ RKA2 handler
 		/* 7630 */    07300,  //		CLA CLL
 		/* 7631 */    01227,  //		TAD HND5		/ POINTER to parameters
-		/* 7632 */    06774,  //		6774			/ SIMULATES RXA0:
+		/* 7632 */    06774,  //		6774			/ SIMULATES RKA2:
 		//					  //		No return here, driver will return to caller directly
-		/* 7633 */    07402,  //  HND6,	HLT				/ TMP0 handler
+		/* 7633 */    07402,  //  HND6,	HLT				/ RKB2 handler
 		/* 7634 */    07300,  //		CLA CLL
 		/* 7635 */    01233,  //		TAD HND6		/ POINTER to parameters
-		/* 7636 */    06775   //		6775			/ SIMULATES TMP0:
+		/* 7636 */    06775,  //		6775			/ SIMULATES RKB2:
+		//					  //		No return here, driver will return to caller directly
+		/* 7637 */    07402,  //  HND7,	HLT				/ DTA0 handler
+		/* 7640 */    07300,  //		CLA CLL
+		/* 7641 */    01237,  //		TAD HND7		/ POINTER to parameters
+		/* 7642 */    06776,  //		6776			/ SIMULATES DTA0:
+		//					  //		No return here, driver will return to caller directly
+		/* 7643 */    07402,  //  HND8,	HLT				/ DTA1 handler
+		/* 7644 */    07300,  //		CLA CLL
+		/* 7645 */    01243,  //		TAD HND8		/ POINTER to parameters
+		/* 7646 */    06777,  //		6777			/ SIMULATES DTA1:
 		//					  //		No return here, driver will return to caller directly
 } ;
 
-// Common data for the telnet server and console handling. 6 devices
-#define NUMDEV 6
+// Common data for the telnet server and console handling. 8 devices
+#define NUMDEV 8
 typedef struct
 {
 	char		devname[4+1] ;							// Device name/partition name plus delimiter
@@ -170,15 +200,17 @@ typedef struct
 } devinfo_t ;
 
 // Info about the peripheral devices  RKA0/RKB0 must be entry 0 and 1.  Sequence must be the same as
-// the "super" IOTs 6770..6775.
+// the "super" IOTs 6770..6777.
 	devinfo_t		devices[NUMDEV] =
 				{
 		/* 0 */		{ "RKA0", 0, DSKSIZE,  ".rk05", 0,       false },	// Combined with RKB0
 		/* 1 */ 	{ "RKB0", 0, DSKSIZE,  ".rk05", DSKSIZE, false },	// Combined with RKA0
-		/* 2 */ 	{ "DTA0", 0, TAPESIZE, ".tu56", 0,       true  },
-		/* 3 */		{ "DTA1", 0, TAPESIZE, ".tu56", 0,       true  },
-		/* 4 */		{ "RXA0", 0, FLOPSIZE, ".rx01", 0,       false },
-		/* 5 */		{ "TMP0", 0, TMPSIZE,  ".tm01", 0,       false }
+		/* 2 */		{ "RKA1", 0, DSKSIZE,  ".rk05", 0,       false },	// Combined with RKB1
+		/* 3 */ 	{ "RKB1", 0, DSKSIZE,  ".rk05", DSKSIZE, false },	// Combined with RKA1
+		/* 4 */		{ "RKA2", 0, DSKSIZE,  ".rk05", 0,       false },	// Combined with RKB2
+		/* 5 */ 	{ "RKB2", 0, DSKSIZE,  ".rk05", DSKSIZE, false },	// Combined with RKA2
+		/* 6 */ 	{ "DTA0", 0, TAPESIZE, ".tu56", 0,       true  },
+		/* 7 */		{ "DTA1", 0, TAPESIZE, ".tu56", 0,       true  },
 				};
 
 int				clientSock = -1 ;						// Client socket
@@ -187,7 +219,7 @@ QueueHandle_t	tls_queue ;								// Queue for telnet output (print)
 uint8_t			kbd_last = 0 ;							// Last character seen
 bool			kbd_flag = false ;						// Character available
 bool			abortf = false ;						// Flag to abort telnet and ESP
-uint16_t		seldev = 5 ;							// Selected device (TMP0) for load/save image
+uint16_t		seldev = 0 ;							// Selected device (RKA0) for load/save image
 
 enum { START, WAIT_ANY, WAIT_CMD } menu_state = START ;	// State of menu
 
@@ -199,6 +231,10 @@ esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = fals
 												} ;
 sdmmc_card_t*					 card ;					// SD/MMC card information structure
 bool							 card_okay ;			// True if a good card inserted
+
+// Data for OTA
+esp_ota_handle_t				  esp_ota_handle = 0 ;	// Operate handle : uninitialized value is zero
+const esp_partition_t*			  ota_partition ;		// OTA partition to operate on
 
 // Forward declarations
 void boot() ;
@@ -408,7 +444,7 @@ void download ( const char* url )
 		return ;
 	}
 	freeaddrinfo ( res ) ;
-	getres = sendsocket ( s, "GET " ) && 						// Send GET command to host
+	getres = sendsocket ( s, "GET " ) && 					// Send GET command to host
 			 sendsocket ( s, spec ) &&
 			 sendsocket ( s, " HTTP/1.1\r\n"
 							 "Host: ") &&
@@ -506,14 +542,246 @@ void download ( const char* url )
 	}
 	if ( dlleng == filesz )									// Download complete?
 	{
-		str_put ( "\r\nDownload completed\r\n" ) ;				// Yes, show the good news
+		str_put ( "\r\nDownload completed\r\n" ) ;			// Yes, show the good news
 		flushcache() ;										// Force actual write
 	}
 	else
 	{
-		str_put ( "\r\nError downloading image!\r\n" ) ;		// Show error
+		str_put ( "\r\nError downloading image!\r\n" ) ;	// Show error
 	}
 	close ( s ) ;
+}
+
+
+//***********************************************************************************************
+//									O T A _ I N I T												*
+//***********************************************************************************************
+// Initialize OTA stuff.																		*							
+//***********************************************************************************************
+bool ota_init()
+{
+    esp_err_t				err ;									// Returned result
+	ota_partition = esp_ota_get_next_update_partition ( NULL ) ;	// Next OTA partition to load	
+    err = esp_ota_begin ( ota_partition, OTA_SIZE_UNKNOWN,			// Get handle for this partition
+						  &esp_ota_handle ) ;
+    if ( err != ESP_OK )
+	{
+        ESP_LOGE ( tag, "esp_ota_begin failed err=0x%x!", err ) ;
+    }
+	else
+	{
+        ESP_LOGI ( tag, "esp_ota_begin init OK" ) ;
+        return true ;
+    }
+    return false;
+}
+
+
+
+//***********************************************************************************************
+//									G E T S O C K E T											*
+//***********************************************************************************************
+// Get socket connected to URL.  The socket will be returned.  Filesize will be set.			*							
+//***********************************************************************************************
+int getsocket ( const char* url, int* filesize )
+{
+	char*				p ;									// Pointer in url
+	char				host[50] ;							// Hostname from url
+	char				spec[80] ;							// Page/file specification from url
+	char				recv_buf[64] ;						// Buffer to receive header lines
+	int					err ;								// Error code from getaddrinfo
+	const struct		addrinfo hints =   {				// Socket parameters
+							.ai_family = AF_INET,
+							.ai_socktype = SOCK_STREAM } ;
+	struct addrinfo*	res ;
+	int					s ;									// Socket handle
+	bool				getres ;							// Result of GET request
+	int					inx ;								// Index in recv_buf
+	int					rbytes ;							// Number of bytes received
+
+	strncpy ( host, url, sizeof(host) ) ;					// Copy the host plus garbage
+	p = strstr ( url, "/" ) ;								// Search for spec
+	if ( p == NULL )										// Slash should be there
+	{
+		return -1 ;											// Problem
+	}
+	strncpy ( spec, p, sizeof(spec)  ) ;					// Isolate page/file specification
+	p = strstr ( host, "/" ) ;								// Search for spec
+	*p = '\0' ;												// Delimeter for host
+	ESP_LOGI ( tag, "GET %s from %s",
+			   spec, host ) ;
+	err = getaddrinfo ( host, "80", &hints, &res ) ;		// Get IP of host
+	if ( err != 0 || res == NULL )
+	{
+		str_put ( "DNS lookup failed err=%d res=%p",
+				  err, res ) ;
+		return -1 ;
+	}
+	s = socket ( res->ai_family, res->ai_socktype, 0 ) ;	// Allocate socket
+	if ( s < 0 )
+	{
+		str_put ( "...Failed to allocate socket." ) ;
+		freeaddrinfo ( res ) ;
+		return -1 ;
+	}
+	if ( connect ( s, res->ai_addr, res->ai_addrlen ) != 0 )
+	{
+		str_put ( "... socket connect failed errno=%d", errno ) ;
+		close ( s ) ;
+		freeaddrinfo ( res ) ;
+		return -1 ;
+	}
+	freeaddrinfo ( res ) ;
+	getres = sendsocket ( s, "GET " ) && 					// Send GET command to host
+			 sendsocket ( s, spec ) &&
+			 sendsocket ( s, " HTTP/1.1\r\n"
+							 "Host: ") &&
+			 sendsocket ( s, host ) &&
+			 sendsocket ( s, "\r\n"
+					 	 	 "User-Agent: esp-idf/1.0 esp32\r\n"
+					 	 	 "Connection: close\r\n\r\n" ) ;
+	if ( !getres )
+	{
+		str_put ( "... socket send failed" ) ;
+		close ( s) ;
+		return -1 ;
+	}
+	// Read HTTP response
+	inx = 0 ;
+	while ( true )											// Read HTTP response lines
+	{
+		rbytes = read ( s, &recv_buf[inx], 1 ) ;			// Get one character
+		if ( rbytes > 0 )
+		{
+			if ( recv_buf[inx] == '\r' )					// Ignore CR
+			{
+				continue ;
+			}
+			else if ( recv_buf[inx] == '\n' )				// LineFeed?
+			{
+				recv_buf[inx] = '\0' ;						// Yes, store delimeter
+				if ( inx == 0 )								// Empty line?
+				{
+					break ;									// End of header
+				}
+				str_put ( "%s\r\n", recv_buf ) ;			// Show to user
+				if ( strstr ( recv_buf,
+							  "Content-Length: " ) )
+				{
+					*filesize = atoi ( recv_buf + 16 ) ;	// Get length in bytes
+				}
+				inx = 0 ;									// Start new line
+				continue ;
+			}
+			inx++ ;
+		}
+	}
+	return s ;
+}
+
+
+//***********************************************************************************************
+//							B A C K T O F A C T O R Y											*
+//***********************************************************************************************
+// Return to factory version.																	*
+// This will set the otadata to boot from the factory image, ignoring previous OTA updates.		*
+//***********************************************************************************************
+void backtofactory()
+{
+	esp_partition_iterator_t	pi ;						// Iterator for find
+	const esp_partition_t*		factory ;					// Factory partition
+	esp_err_t					err ;
+
+	pi = esp_partition_find ( ESP_PARTITION_TYPE_APP,		// Get partition iterator for
+			ESP_PARTITION_SUBTYPE_APP_FACTORY,				// factory partition
+			"factory" ) ;
+	if ( pi == NULL )										// Check result
+	{
+		ESP_LOGE ( tag, "Failed to find factory partition" ) ;
+	}
+	else
+	{
+		factory = esp_partition_get ( pi ) ;				// Get partition struct
+		esp_partition_iterator_release ( pi ) ;				// Release the iterator
+		err = esp_ota_set_boot_partition ( factory ) ;		// Set partition for boot
+		if ( err != ESP_OK )								// Check error
+		{
+		  ESP_LOGE ( tag, "Failed to set boot partition" ) ;
+		}
+		else
+		{
+			esp_restart() ;									// Restart ESP
+		}
+	}
+}
+
+
+//***********************************************************************************************
+//									O T A L O A D												*
+//***********************************************************************************************
+// Download new application image from the internet and store it on OTA partition.				*
+//***********************************************************************************************
+void otaload ( const char* url )
+{
+	int					s ;									// Socket handle
+	int					rqbytes ;							// Number of bytes requested
+	int					rbytes ;							// Number of bytes received
+	int					filesz = 0 ;						// Size of file to download
+	int					dlleng = 0 ;						// Number of bytes downloaded
+    esp_err_t			err ;								// Result of OTA writes
+
+	s = getsocket ( url, &filesz ) ;						// Get socket for input from server
+	if ( ( s < 0 ) || ( filesz == 0 ) )						// Socket okay and file found?
+	{
+		return ;											// No, exit
+	}
+	if ( ota_init() == false )								// Init OTA stuff
+	{
+		close ( s ) ;
+		return ;
+	}
+	str_put ( "Loading OTA, %d bytes. "						// Show info
+			  "This may take a while...\r\n",
+			  filesz ) ;
+	rqbytes = sizeof(wrdbuf) ;								// Try to read full buffer (1 block)
+	while ( dlleng < filesz )								// Read disk image from server
+	{
+		vTaskDelay ( 10 / portTICK_PERIOD_MS ) ;			// Allow some time between chunks
+		rbytes = read ( s, wrdbuf, rqbytes ) ;				// Read into wrdbuf
+		err = esp_ota_write ( esp_ota_handle,				// Write to OTA
+							  (const void*)wrdbuf,
+							  rbytes ) ;
+		if ( err != ESP_OK )
+		{
+			ESP_LOGE ( tag, "Error: esp_ota_write failed! err=0x%x", err ) ;
+			break ;
+		}
+		dlleng += rbytes ;									// Update number of bytes read sofar
+	}
+	close ( s ) ;
+	if ( dlleng == filesz )									// Download complete?
+	{
+		str_put ( "\r\nDownload completed\r\n" ) ;			// Yes, show the good news
+	}
+	else
+	{
+		str_put ( "\r\nError downloading image!\r\n" ) ;	// Show error
+		return ;
+	}
+	if ( esp_ota_end ( esp_ota_handle ) != ESP_OK )			// Finish OTA
+	{
+        ESP_LOGE ( tag, "esp_ota_end failed!" ) ;
+		return ;
+	}
+	err = esp_ota_set_boot_partition ( ota_partition ) ;	// Set partition for boot
+	if ( err != ESP_OK )
+	{
+    	ESP_LOGE ( tag, "esp_ota_set_boot_partition failed! err=0x%x", err ) ;
+	}
+	else
+	{
+		esp_restart() ;										// Restart ESP
+	}
 }
 
 
@@ -585,21 +853,21 @@ void show_sd_dir ( const char* ext )
 //***********************************************************************************************
 //									G E T _ D E V N A M E										*
 //***********************************************************************************************
-// Get device name from devices table.  Special handling of RKA0/RKB0							*
+// Get device name from devices table.  Special handling of RKAx/RKBx disks.					*
 //***********************************************************************************************
 const char* get_devname ( uint16_t inx )
 {
 	static char devname[12] ;							// Space for selected device name
 
-	if ( inx == 0 )
+	if ( strstr ( devices[inx].devname, "RKA" ) )
 	{
-		sprintf ( devname, "%s/%s",						// Exception for RKA0/RKB0
+		sprintf ( devname, "%s/%s",						// Exception for RKAx/RKBx
 				  devices[inx].devname,
 				  devices[inx+1].devname ) ;
 	}
 	else
 	{
-		sprintf ( devname, "%s",						// Exception for RKA0/RKB0
+		sprintf ( devname, "%s",						// Normal hanling (not RXAx/RKBx
 				  devices[inx].devname ) ;
 	}
 	return devname ;
@@ -616,14 +884,16 @@ const char* get_devname ( uint16_t inx )
 //***********************************************************************************************
 void show_devs()
 {
+	const char* p ;										// Points to device name
+
 	for ( int i = 0 ; i < NUMDEV ; i++ )				// Show all devices
 	{
+		p = get_devname ( i ) ;							// Get device name
 		str_put ( "Option SL %d -> %s\r\n",				// Format and show the option
-				  i,
-				  get_devname ( i ) ) ;
-		if ( i == 0 )									// Special RKA0/RKB0
+				  i, p ) ;
+		if ( strstr ( p, "RKA" ) )						// Special RKAx/RKBx ?
 		{
-			i++ ;										// Skip RKB0
+			i++ ;										// Skip RKBx
 		}
 	}
 }
@@ -924,6 +1194,7 @@ void ex_mnu_cmd ( const char *cmd )
 	char*			pa = NULL ;								// Alfanumerical parameter 1
 	int16_t			p1 = -1 ;								// Numerical parameters 1 in command
 	int16_t			p2 = -1 ;								// Numerical parameters 1 in command
+	const char*		dvnam ;									// Points to device name in devices
 
 	p = strstr ( cmd, " " ) ;  								// Parameter 1 supplied?
 	if ( ( p != NULL && ( strlen(p) > 1 ) ) )				// Reasonable parameter?
@@ -1008,10 +1279,25 @@ void ex_mnu_cmd ( const char *cmd )
 	{
 		if ( pa == NULL )									// URL supplied?
 		{
-			pa = "www.pdp8online.com"
-				 "/ftp/images/os8/diag-games-kermit.rk05" ;
+			//pa = "www.pdp8online.com"
+			//	   "/ftp/images/os8/diag-games-kermit.rk05" ;
+			pa = "www.smallenburg.nl"
+				 "/pdp8/os8patched.rk05" ;
 		}
 		download ( pa ) ;									// Download a fresh image
+	}
+	else if ( tcmd ( cmd, "UP" ) )							// Update software(OTA)?
+	{
+		if ( pa == NULL )									// URL supplied?
+		{
+			pa = "www.smallenburg.nl"
+				 "/pdp8/esp-pdp8.bin" ;
+		}
+		otaload ( pa ) ;									// Download a fresh image
+	}
+	else if ( tcmd ( cmd, "BF" ) )							// Back to factory version?
+	{
+		backtofactory() ;									// Yes
 	}
 	else if ( tcmd ( cmd, "LD" ) )							// Load image from SD?
 	{
@@ -1019,10 +1305,11 @@ void ex_mnu_cmd ( const char *cmd )
 		{
 			if ( card_okay )
 			{
+				dvnam = devices[seldev].devname ;			// Get device name
 				load_sd ( seldev, pa ) ;					// Load file from SD to selected device
-				if ( seldev == 0 )							// Special handling for RKA0/RKB0
-				{
-					load_sd ( seldev + 1, pa ) ;			// 2nd half of image to RKB0
+				if ( strstr ( dvnam, "RKA" ) )				// RKAx/RKBx ? 
+				{											// Special handling for RKAx/RKBx
+					load_sd ( seldev + 1, pa ) ;			// 2nd half of image to RKBx
 				}
 			}
 		}
@@ -1139,6 +1426,7 @@ void menu()
 			"\e[9;0f"   "UC - Toggle UPPER case flag"
 			"\e[10;0f"  "SR - Set switch register"
 			"\e[11;0f"  "PR - Set filename for PTR"
+			"\e[12;0f"  "UP - Software update (OTA)"
 			"\e[5;40f"  "PO - Power-off"
 			"\e[6;40f"  "DW - Download RKA0+RKB0 image"
 			"\e[7;40f"  "SL - Select device for LD/SV"
@@ -1146,7 +1434,8 @@ void menu()
 			"\e[9;40f"  "SV - Save image to SD card"
 			"\e[10;40f" "FL - Flush cache buffers"
 			"\e[11;40f" "PP - Set filename for PTP"
-			"\e[13;0f"
+			"\e[12;40f" "BF - Back to factory version"
+			"\e[14;0f"
 			"Option: " ;
 	uint8_t			c ;										// Input character
 	static char		cmd[130] ;								// Input from user
@@ -1164,7 +1453,7 @@ void menu()
 	{
 		str_put ( menutxt ) ;								// Send to telnet client
 		str_put ( "\e[s" ) ;								// Save cursor
-		str_put ( "\e[15;0f" ) ;							// Cursor to status position
+		str_put ( "\e[16;0f" ) ;							// Cursor to status position
 		str_put ( "\e[32m") ;								// Green
 		str_put ( "PC %o:%04o  -  DF %o  -  "				// Show machine status
 				  "AC %o:%04o  -  MQ %04o  -  "
@@ -1298,16 +1587,16 @@ void telnet_server ( void *pvParameter )
 		goto END ;
 	}
 	// Flag the socket as listening for new connections.
-	rc = listen ( sock, 1 ) ;									// listen for 1 connection
+	rc = listen ( sock, 1 ) ;									// Listen for 1 connection
 	if ( rc < 0 )												// Check for error
 	{
 		ESP_LOGE ( tag, "listen: %d %s",						// Report error
 				rc, strerror(errno) ) ;
 		goto END ;
 	}
-	kbd_queue = xQueueCreate( 256, sizeof(uint8_t) ) ;			// Init 2 queues
-	tls_queue = xQueueCreate( 256, sizeof(uint8_t) ) ;			// for input and output
-	while ( true )												// Listen for a new client connection.
+	kbd_queue = xQueueCreate( 512, sizeof(uint8_t) ) ;			// Init 2 queues
+	tls_queue = xQueueCreate( 512, sizeof(uint8_t) ) ;			// for input and output
+	while ( !abortf )											// Listen for a new client connection.
 	{
 		clientAddressLength = sizeof(clientAddress) ;
 		clientSock = accept ( sock,
@@ -1321,7 +1610,7 @@ void telnet_server ( void *pvParameter )
 		}
 		ESP_LOGI ( tag, "New client connected" ) ;				// We now have a new client ...
 		welcome() ;												// Display welcome message
-		while ( true )
+		while ( !abortf )
 		{
 			idle = true ;										// Assume no activity
 			if ( uxQueueSpacesAvailable ( kbd_queue ) )			// Do we have space for keystrokes?
@@ -1362,17 +1651,13 @@ void telnet_server ( void *pvParameter )
 			if ( idle )											// Nothing to do, wait some time
 			{
 				vTaskDelay ( 10 / portTICK_PERIOD_MS ) ;		// Sleep some time
-				if ( abortf )
-				{
-					vTaskDelay ( 3000 / portTICK_PERIOD_MS ) ;	// Sleep some time
-					break ;										// End connection
-				}
 			}
 			if ( !running )
 			{
 				menu() ;										// Handle menu
 			}
 		}
+		vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;				// Give some at power off
 		close ( clientSock ) ;									// Client has disconnected
 		clientSock = -1 ;										// Prevent closing socket twice
 	}
@@ -1383,6 +1668,12 @@ void telnet_server ( void *pvParameter )
 	}
 	vQueueDelete ( kbd_queue ) ;								// Clean-up the queues
 	vQueueDelete ( tls_queue ) ;
+	#ifdef CONFIG_OLED
+		vTaskDelete ( th_console ) ;							// End of display task (if any)
+	#endif
+	ESP_LOGI ( tag, "Stopping CPU, go to sleep" ) ;
+	ssd1306_clear() ;											// Clear the display
+	vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;					// Give some time to clear
 	esp_deep_sleep_start() ;									// and go to sleep
 	// Will not return here...
 	//vTaskDelete ( NULL ) ;									// End of task
@@ -1392,6 +1683,34 @@ void telnet_server ( void *pvParameter )
 //***********************************************************************************************
 // END of telnet server part																	*
 //***********************************************************************************************
+
+
+//***********************************************************************************************
+//								C O N S O L E _ T A S K											*
+//***********************************************************************************************
+// Task to simulate the console ligths on the OLED.												*
+//***********************************************************************************************
+void console_task ( void *pvParameter )
+{
+	ssd1306_init ( atoi ( CONFIG_SDA_PIN ),						// Initialize the display
+				   atoi ( CONFIG_SCL_PIN ),
+				   atoi ( CONFIG_RST_PIN ) ) ;
+	ssd1306_setmarkers ( 0, 0777777 ) ;							// DF, IF and PC
+	ssd1306_setmarkers ( 1, 07777 ) ;             				// MA
+	ssd1306_setmarkers ( 2, 07777 ) ;             				// MB
+	ssd1306_setmarkers ( 3, 017777 ) ;            				// L and AC
+	ssd1306_setmarkers ( 4, 07777 ) ;             				// MQ
+    while ( true )
+	{
+		ssd1306_show_register ( 0, DF << 15 | IF << 12 | PC ) ;	// DF, IF and PC
+		ssd1306_show_register ( 1, MA ) ;						// MA
+		ssd1306_show_register ( 2, MB ) ;						// MB
+		ssd1306_show_register ( 3, AC ) ;						// L and AC
+		ssd1306_show_register ( 4, MQ ) ;						// MQ
+		ssd1306_display() ;										// Show it
+		//vTaskDelay ( portTICK_PERIOD_MS ) ;						// Sleep a while
+	}
+}
 
 
 //***********************************************************************************************
@@ -1407,6 +1726,8 @@ static esp_err_t event_handler ( void *ctx, system_event_t *event )
 		esp_wifi_connect() ;
 		break ;
 	case SYSTEM_EVENT_STA_GOT_IP :
+		ip_Addr = event->event_info.got_ip.ip_info.ip ;			// Get IP address of station
+		MQ = ip_Addr.addr >> 24 ;								// Show LS digit of IP in MQ
 		xEventGroupSetBits ( wifi_event_group, CONNECTED_BIT ) ;
 		break ;
 	case SYSTEM_EVENT_STA_DISCONNECTED :
@@ -1431,6 +1752,7 @@ static esp_err_t event_handler ( void *ctx, system_event_t *event )
 static void initialize_wifi ( void )
 {
 	tcpip_adapter_init() ;
+    tcpip_adapter_set_hostname ( TCPIP_ADAPTER_IF_STA, "ESP32_PDP8" ) ;
 	wifi_event_group = xEventGroupCreate() ;
 	ESP_ERROR_CHECK ( esp_event_loop_init ( event_handler, NULL ) ) ;
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT() ;
@@ -1894,23 +2216,23 @@ void boot()
 //***********************************************************************************************
 uint16_t* opAddr()										// Get address specified by operand
 {
-	uint16_t adr ;										// Effective address
-
-	adr = IR & 0177 ;									// Address in current page or page 0
+	MA = IR & 0177 ;									// Address in current page or page 0
 	if ( IR & 0200 )									// Current page?
 	{
-		adr |= ( PC - 1 ) & 07600 ;						// Yes, add base page
+		MA |= ( PC - 1 ) & 07600 ;						// Yes, add base page
 	}
 	if ( IR & 0400 )									// Indirect?
 	{
-		if ( ( adr & 07770 ) == 010 )					// Auto increment address (10..17)?
+		if ( ( MA & 07770 ) == 010 )					// Auto increment address (10..17)?
 		{
-			MEM[IF][adr] = ( MEM[IF][adr]+1 ) & 07777 ; // Yes, increment pointer first
+			MEM[IF][MA] = ( MEM[IF][MA]+1 ) & 07777 ;   // Yes, increment pointer first
 		}
-		adr = MEM[IF][adr] ;							// Load effective address
-		return &MEM[DF][adr] ;							// Address in DF
+		MA = MEM[IF][MA] ;								// Load effective address
+		MB = MEM[DF][MA] ;								// MB for console display
+		return &MEM[DF][MA] ;							// Address in DF
 	}
-	return &MEM[IF][adr] ;								// Address in IF
+	MB = MEM[IF][MA] ;									// MB for console display
+	return &MEM[IF][MA] ;								// Address in IF
 }
 
 
@@ -1921,22 +2243,20 @@ uint16_t* opAddr()										// Get address specified by operand
 //***********************************************************************************************
 uint16_t opAddrJ()										// Get address specified by operand
 {
-	uint16_t adr ;										// Effective address
-
-	adr = IR & 0177 ;									// Address in current page or page 0
+	MA = IR & 0177 ;									// Address in current page or page 0
 	if ( IR & 0200 )									// Current page?
 	{
-		adr |= ( PC - 1 ) & 07600 ;						// Yes, add base page
+		MA |= ( PC - 1 ) & 07600 ;						// Yes, add base page
 	}
 	if ( IR & 0400 )									// Indirect?
 	{
-		if ( ( adr & 07770 ) == 010 )					// Auto increment address (10..17)?
+		if ( ( MA & 07770 ) == 010 )					// Auto increment address (10..17)?
 		{												// Although unlikely for JMP/JMS
-			MEM[IF][adr] = ( MEM[IF][adr]+1 ) & 07777 ;	// Yes, increment pointer first
+			MEM[IF][MA] = ( MEM[IF][MA]+1 ) & 07777 ;	// Yes, increment pointer first
 		}
-		adr = MEM[IF][adr] ;							// Load effective address
+		MA = MEM[IF][MA] ;								// Load effective address
 	}
-	return adr ;										// Address
+	return MA ;											// Address
 }
 
 
@@ -2179,10 +2499,12 @@ void iot()
 		{
 		case 06770 :								// RKA0:
 		case 06771 :								// RKB0:
-		case 06772 :								// DTA0:
-		case 06773 :								// DTA1:
-		case 06774 :								// RXA0:
-		case 06775 :								// TMP0:
+		case 06772 :								// RKA1:
+		case 06773 :								// RKB1:
+		case 06774 :								// RKA2:
+		case 06775 :								// RKB2:
+		case 06776 :								// DTA0:
+		case 06777 :								// DTA1:
 			hndl = devices[IR & 07].handle ;		// Get the handle
 			blockdriver ( hndl ) ;					// Handle read/write block
 			break ;
@@ -2405,17 +2727,17 @@ void app_main()
 	uint16_t		flushcount = 0 ;						// Timer for flushing cache
 	esp_err_t		ret ;									// Result card mount
 	uint16_t		sd_sc_pin ;								// Pin for CS of SD card
-	TaskHandle_t	th_telnet ;								// Task handle for telnet task
-	TaskHandle_t	th_sim ;								// Task handle for simulator task
 	uint16_t		show_stack = 59 ;						// Counter for showing stack space
 
 	esp_sleep_pd_config ( ESP_PD_DOMAIN_RTC_PERIPH,			// Init deep-sleep mode
-							   ESP_PD_OPTION_AUTO ) ;
+						  ESP_PD_OPTION_AUTO ) ;
 	esp_sleep_enable_ext0_wakeup ( 0, 0 ) ;					// Wake if GPIO is low
     nvs_flash_init() ;										// Needed for WiFi init
+	ESP_LOGI ( tag, "Booted from %s partition",				// Show boot partition
+			   esp_ota_get_boot_partition()->label ) ;
 	sd_sc_pin = atoi ( CONFIG_SC_CS ) ;						// SD card select pin as integer
 	gpio_pullup_en ( 0 ) ;									// Use pull-up on GPIO 0 (EN)
-	gpio_pulldown_dis ( 0) ;								// Not use pull-down on GPIO 0
+	gpio_pulldown_dis ( 0 ) ;								// Not use pull-down on GPIO 0
 	gpio_set_pull_mode ( sd_sc_pin, GPIO_PULLUP_ONLY ) ;	// Pull up for CS pin
 	slot_config.gpio_miso = 19 ;							// Use VSPI SPI
 	slot_config.gpio_mosi = 23 ;
@@ -2470,6 +2792,10 @@ void app_main()
 						"and telnet server" ) ;
 	xTaskCreate ( &pdp8_task,     "PDP8_task",     3000, NULL, 5, &th_sim ) ;
 	xTaskCreate ( &telnet_server, "telnet_server", 3000, NULL, 5, &th_telnet ) ;
+	#ifdef CONFIG_OLED
+		ESP_LOGI ( tag, "Starting PDP8 Console task" ) ;
+		xTaskCreate ( &console_task, "Console",    3000, NULL, 5, &th_console ) ;
+	#endif
 	while ( true )
 	{
 		vTaskDelay ( 10000 / portTICK_PERIOD_MS ) ;			// Sleep 10 seconds
@@ -2477,16 +2803,21 @@ void app_main()
 		{
 			// Yes, show memory usage
 			ESP_LOGI ( tag,
-					   "Free stack space telnet task is    %5d words",
+					   "Free stack space telnet task is %5d words",
 					   uxTaskGetStackHighWaterMark ( th_telnet ) ) ;
 			ESP_LOGI ( tag,
 					   "Free stack space simulator task is %5d words",
 					   uxTaskGetStackHighWaterMark ( th_sim ) ) ;
+			#ifdef CONFIG_OLED
+				ESP_LOGI ( tag,
+						   "Free stack space console simulator task is %5d words",
+						   uxTaskGetStackHighWaterMark ( th_console ) ) ;
+			#endif
 			ESP_LOGI ( tag,
-					   "Free stack space main task is      %5d words",
+					   "Free stack space main task is %5d words",
 					   uxTaskGetStackHighWaterMark ( NULL ) ) ;
 			ESP_LOGI ( tag,
-					   "Free heap space is                %6d bytes",
+					   "Free heap space is %6d bytes",
 					   esp_get_free_heap_size() ) ;
 		}
 		if ( instcount )
