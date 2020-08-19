@@ -17,6 +17,7 @@
 // 11-OCT-2017, ES	Correction default date.													*
 // 15-JAN-2018, ES	Version for ESP module with 0.96 inch OLED and 128 Mbit flash.				*
 // 16-JAN-2018, ES	OTA update of application software.											*
+// 19-AUG-2020, ES  Changed some include files to get rid of errors/warning.					*
 //***********************************************************************************************
 //
 #include <stdio.h>
@@ -30,7 +31,6 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_event_loop.h"
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
@@ -43,11 +43,11 @@
 #include <time.h>
 #include <sys/time.h>
 #include "lwip/err.h"
-#include "apps/sntp/sntp.h"
+#include "esp_sntp.h"
 #include "wear_levelling.h"
 #include <errno.h>
 #include <sys/fcntl.h>
-#include "rom/uart.h"
+#include "esp32/rom/uart.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -1672,7 +1672,9 @@ void telnet_server ( void *pvParameter )
 		vTaskDelete ( th_console ) ;							// End of display task (if any)
 	#endif
 	ESP_LOGI ( tag, "Stopping CPU, go to sleep" ) ;
+	#ifdef CONFIG_OLED
 	ssd1306_clear() ;											// Clear the display
+    #endif
 	vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;					// Give some time to clear
 	esp_deep_sleep_start() ;									// and go to sleep
 	// Will not return here...
@@ -1685,6 +1687,7 @@ void telnet_server ( void *pvParameter )
 //***********************************************************************************************
 
 
+#ifdef CONFIG_OLED
 //***********************************************************************************************
 //								C O N S O L E _ T A S K											*
 //***********************************************************************************************
@@ -1708,10 +1711,10 @@ void console_task ( void *pvParameter )
 		ssd1306_show_register ( 3, AC ) ;						// L and AC
 		ssd1306_show_register ( 4, MQ ) ;						// MQ
 		ssd1306_display() ;										// Show it
-		//vTaskDelay ( portTICK_PERIOD_MS ) ;						// Sleep a while
+		//vTaskDelay ( portTICK_PERIOD_MS ) ;					// Sleep a while
 	}
 }
-
+#endif
 
 //***********************************************************************************************
 //								E V E N T _ H A N D L E R										*
@@ -1782,6 +1785,7 @@ static void initialize_sntp ( void )
 	sntp_setoperatingmode ( SNTP_OPMODE_POLL ) ;
 	sntp_setservername ( 0, "pool.ntp.org" ) ;
 	sntp_init() ;
+	
 }
 
 
