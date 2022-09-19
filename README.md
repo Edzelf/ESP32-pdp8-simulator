@@ -9,3 +9,5 @@ There is a simpler version in the archive dirrectory that wil run on a bare ESP3
 This is a esp-idf project.  Run "make menuconfig" first to configure Wifi settings and the like.
 
 Read the documentation for details.
+
+In the archive is a 4MB version using Arduino platform.
