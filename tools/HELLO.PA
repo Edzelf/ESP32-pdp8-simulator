@@ -1,0 +1,35 @@
+        *200
+START,  TAD (TEKST
+        JMS PRSTR
+        JMP I (7600
+
+PRSTR,  HLT
+        DCA PNT                 / POINTER IN STRING
+LOOP,   TAD I PNT               / PAK WOORD MET 2 CHARACTERS
+        BSW                     / PAK LINKER DEEL
+        JMS PRINTR              / PRINT RECHTER 6 BITS ALS CHARACTER
+        JMP I PRSTR             / END OF TEXT
+        TAD I PNT               / PAK WOORD NOGMAALS
+        JMS PRINTR
+        JMP I PRSTR             / END OF TEXT
+        ISZ PNT                 / UPDATE POINTER
+        JMP LOOP
+
+PRINTR, HLT
+        AND (77                 / MASK 6 BITS
+        SNA
+        JMP I PRINTR            / END OF TEXT
+        ISZ PRINTR              / NORMAL RETURN
+        TAD (-40                / < 40?
+        SPA
+        TAD (100                / NEE, MAAK ASCII 301..337
+        TAD (240                / MAAK ASCII 301..377
+        TLS
+        TSF                     / WACHT OP PRINTER
+        JMP .-1
+        CLA
+        JMP I PRINTR
+
+PNT,    0
+TEKST,  TEXT 'HALLO WERELD!'
+        $
