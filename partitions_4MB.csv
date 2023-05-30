@@ -1,0 +1,12 @@
+# Partition table for limited number of devices (4MB version)
+# Name,   Type, SubType,  Offset,    Size,     Flags
+nvs,      data, nvs,      0x009000,  0x004000,
+otadata,  data, ota,      0x00D000,  0x002000,
+phy_init, data, phy,      0x00F000,  0x001000,
+factory,  app,  factory,  0x010000,  0x0E0000,
+RKA0,     data, 0x80,     0x0F0000,  0x140000,
+RKB0,     data, 0x80,     0x230000,  0x140000,
+DTA0,     data, 0x81,     0x370000,  0x04C000,
+RXA0,     data, 0x82,     0x3BC000,  0x034000,
+coredump, data, coredump, 0x3F0000,  0x010000,
+#                         0x400000

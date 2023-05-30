@@ -1,0 +1,18 @@
+# Partitioning table for 16 MB flash
+# Name,   Type, SubType,  Offset,     Size,     Flags
+nvs,      data, nvs,      0x0009000,  0x004000,
+otadata,  data, ota,      0x000D000,  0x002000,
+phy_init, data, phy,      0x000F000,  0x001000,
+app0,     app,  ota_0,    0x0010000,  0x100000,
+app1,     app,  ota_1,    0x0110000,  0x100000,
+RKA0,     data, 0x80,     0x0210000,  0x140000,
+RKB0,     data, 0x80,     0x0350000,  0x140000,
+RKA1,     data, 0x80,     0x0490000,  0x140000,
+RKB1,     data, 0x80,     0x05D0000,  0x140000,
+RKA2,     data, 0x80,     0x0710000,  0x140000,
+RKB2,     data, 0x80,     0x0850000,  0x140000,
+DTA0,     data, 0x81,     0x0990000,  0x04C000,
+DTA1,     data, 0x81,     0x09DC000,  0x04C000,
+coredump, data, coredump, 0x0A28000,  0x010000,
+#Free                     0x0A38000,  0x5C8000
+#End+1                    0x1000000
