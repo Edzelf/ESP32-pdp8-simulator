@@ -1,0 +1,34 @@
+*200
+        NOP
+L1,     IAC
+        ISZ TALLY
+        JMP .-1
+        DCA PAT1
+        CLA IAC         / 1
+        AND PAT1        / ONEVEN?
+        SNA CLA         / SKIP INDIEN ONEVEN
+        JMP CONT
+        TAD PAT2
+        CLL RAL
+        SNA
+        IAC
+        DCA PAT2
+        TAD PAT2
+        MQL
+        SNL             / LINK GESET DOOR SHIFT?
+        JMP CONT        / NEE
+        TAD PAT1
+        AND (70
+        TAD (CDF
+        DCA .+1
+        CDF 0
+CONT,   TAD PAT1
+        KSF
+        JMP L1
+        CDF 0           / ZET DATAFIELD WEER GOED
+        JMP I (7600
+
+TALLY,  0
+PAT1,   0
+PAT2,   1
+        $
