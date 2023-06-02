@@ -26,14 +26,14 @@ struct page_struct
 class OLED
 {
   public:
-    OLED    ( const char* d_type ) ;                      // Constructor
+              OLED ( const char* d_type, int sda_pin,     // Constructor
+                     int scl_pin ) ;
     void      clear() ;                                   // Clear buffer
     void      display ( bool force = false ) ;            // Display buffer
-    void      setmarkers ( uint8_t pg, uint32_t useRealRandomGenerator ) ;
+    void      setmarkers ( uint8_t pg, uint32_t range ) ;
     void      show_register ( uint8_t pg, uint32_t range,
                               uint32_t r ) ;
-
-
+    bool      i2cScan() ;                                 // Scan I2C bus
   private:
     bool                    isSH1106 = false ;            // Display is a SH1106
     bool                    isSSD1309 = false ;           // Display is a SSD1309 or not

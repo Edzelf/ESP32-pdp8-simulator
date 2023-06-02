@@ -4,9 +4,10 @@
 // Driver for SSD1306/SSD1309/SH1106 display                                                        *
 //***************************************************************************************************
 
-//#include <string.h>
 #include "Wire.h"
 #include "OLED.hpp"
+
+extern void dbgprint ( const char* format, ... ) ;
 
 #define OLED_I2C_ADDRESS   0x3C
 
@@ -89,13 +90,17 @@ uint8_t      initbuf[] =                      // Initial commands to init OLED
 // Constructor for the display.                                                                 *
 // Assumes that Wire.begin() as been called.                                                    *
 //***********************************************************************************************
-OLED::OLED ( const char* d_type )				                        // Constructor
+OLED::OLED ( const char* d_type, int sda_pin, int scl_pin )		  // Constructor
 {
   isSH1106 = ( strncmp ( d_type, "SH", 2 ) == 0 ) ;		          // Get display type
   isSSD1309 = ( strncmp ( d_type, "SSD", 3 ) == 0 ) ;
+  Wire.begin ( sda_pin, scl_pin, (uint32_t)400000 ) ;	          // Init I2C
+	i2cScan() ;												                            // Test I2C bus
   ssdbuf = (page_struct*) malloc ( 8 * sizeof(page_struct) ) ;	// Create buffer for screen
   clear() ;							                                        // Clear the display
+  delay(1500) ; // TEST*TEST*TEST
 }
+
 
 //***********************************************************************************************
 //                                O L E D :: D I S P L A Y                                      *
@@ -107,7 +112,7 @@ void OLED::display ( bool force )
 {
   uint8_t          pg ;						                            // Page number 0..OLED_NPAG - 1
 
-  for ( pg = 0 ; pg < OLED_NPAG ; pg++ )
+  for ( pg = 0 ; pg < OLED_NPAG ; pg++ )                      // Handle all pages
   {
     if ( ssdbuf[pg].dirty || force )				                  // Refresh needed or forced?
     {
@@ -148,7 +153,7 @@ void OLED::display ( bool force )
 void OLED::clear()
 {
   Wire.beginTransmission ( OLED_I2C_ADDRESS ) ;		    // Init, begin transmission
-  Wire.write ( initbuf, sizeof(initbuf) ) ;		        // Write init buffer
+  Wire.write ( initbuf, sizeof(initbuf) ) ;           // Write init buffer
   Wire.endTransmission() ;				                    // End of transmission
   for ( uint8_t pg = 0 ; pg < OLED_NPAG ; pg++ )	    // Handle all pages
   {
@@ -229,3 +234,31 @@ void OLED::show_register ( uint8_t pg, uint32_t range, uint32_t r )
     ssdbuf[pg].rvalue = r ;		          // For next compare
   }
 }
+
+
+//******************************************************************************************
+//                               O L E D :: I 2 C S C A N                                  *
+//******************************************************************************************
+// Scan I2C bus for devices.                                                               *
+//******************************************************************************************
+bool OLED::i2cScan()
+{
+  static bool    i2cfound = false ;						      // True if at least one I2C device found
+
+  dbgprint ( "Scan I2C bus.." ) ;						        // Info with sequence number
+  for ( uint8_t i = 8 ; i < 120 ; i++ )					    // I2Cdetect
+  {
+    Wire.beginTransmission ( i ) ;						      // Begin I2C transmission Address (i)
+    if ( Wire.endTransmission () == 0 )					    // Receive 0 = success (ACK response) 
+    {
+      dbgprint ( "Found I2C address 0x%02X", i ) ;	// Show detected I2C address
+      i2cfound = true ;									            // Remember at least found one
+    }
+  }
+  if ( ! i2cfound )
+  {
+    dbgprint ( "No I2C devices found" ) ;
+  }
+  return i2cfound ;
+}
+

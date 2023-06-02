@@ -23,6 +23,7 @@
 // 24-MAY-2023, ES  Allow ESP to expose an AP if connection to local network fails.             *
 // 25-MAY-2023, ES  Show link on display.  Correction time zone.                                *
 // 30-MAY-2023, ES  Control of simulator by both serial and telnet.                             *
+// 01-JUN-2023, ES  Correction SD read.                                                         *
 //***********************************************************************************************
 //
 #include <Arduino.h>
@@ -80,10 +81,10 @@ int               lc_user = 0 ;						    // Loop counter simulator task
   OLED*           display = NULL ;            // Will point to OLED object
 #endif
 
-uint16_t MEM [8][4096] ;								      // PDP8 32 kw memory stack
+uint16_t MEM [MEMBLOCKS][4096] ;							// PDP8 max 32 kw memory stack
 
-uint16_t*			wrdbuf = &MEM[7][0] ;				    // Buffer for 256 PDP8 words for download
-														                  // shared with 32 kw memory
+uint16_t*			wrdbuf = &MEM[0][04000] ;				// Buffer for 256 PDP8 words for download
+														                  // shared with max 32 kw memory
 uint16_t			os8date ;							          // Date in OS/8 form mmmmdddddyyy
 uint16_t			os8datex ;							        // Extended year bits yy0000000
 
@@ -214,6 +215,7 @@ typedef struct
 				};
 
 int				    clientSock = -1 ;						                // Client socket
+bool          telnetConnected = false ;                   // True if telnet connected
 QueueHandle_t	kbd_queue ;								                  // Queue for telnet input (keystrokes)
 QueueHandle_t	tls_queue ;								                  // Queue for telnet output (print)
 uint8_t			  kbd_last = 0 ;							                // Last character seen
@@ -271,38 +273,11 @@ void dbgprint ( const char* format, ... )
   va_end ( varArgs ) ;									            // End of using parameters
   if ( DEBUG )											                // DEBUG on?
   {
-	Serial.print ( "\x1B[32m") ;						          // Green color
-    Serial.println ( sbuf ) ;							          // Print the info
-	Serial.print ( "\x1B[39m") ;						          // Default color
+	  Serial.print ( "\x1B[32m") ;						        // Green color
+    Serial.print ( sbuf ) ;                         // Print the info
+	  Serial.print ( "\x1B[39m\n") ;					        // Default color
   }
   xSemaphoreGive ( dbgsem ) ;							          // Release resource
-}
-
-
-//******************************************************************************************
-//                                  I 2 C S C A N                                          *
-//******************************************************************************************
-// Scan I2C bus for devices.                                                               *
-//******************************************************************************************
-bool i2cScan()
-{
-  static bool    i2cfound = false ;						      // True if at least one I2C device found
-
-  dbgprint ( "Scan I2C bus.." ) ;						        // Info with sequence number
-  for ( uint8_t i = 8 ; i < 120 ; i++ )					    // I2Cdetect
-  {
-    Wire.beginTransmission ( i ) ;						      // Begin I2C transmission Address (i)
-    if ( Wire.endTransmission () == 0 )					    // Receive 0 = success (ACK response) 
-    {
-      dbgprint ( "Found I2C address 0x%02X", i ) ;	// Show detected I2C address
-      i2cfound = true ;									            // Remember at least found one
-    }
-  }
-  if ( ! i2cfound )
-  {
-    dbgprint ( "No I2C devices found" ) ;
-  }
-  return i2cfound ;
 }
 
 
@@ -315,8 +290,7 @@ void clientSend ( const char* p, size_t size  )
 {
   if ( clientSock >= 0 )                            // TelNet socket opened?
   {
-    if ( send ( clientSock, p, size,                // Yes, send to telnet client
-                MSG_DONTWAIT ) < 0 )
+    if ( send ( clientSock, p, size, 0 ) < 0 )      // Yes, send to telnet client
     {
       dbgprint ( "Send error!" ) ;						      // Error detected
     }
@@ -686,12 +660,12 @@ void download ( const char* url )
 //***********************************************************************************************
 char* search_sd_dir ( const char* ext, uint16_t seq )
 {
-	File			root ;									        // Work directory
-	File			file ;									        // File in work directory
-	struct dirent	*dent ;									    // Directory entry structure
-	uint16_t		i = 0 ;									      // Sequence nr found
-	static char		lstr[50] ;								  // Space for formatted string
-	char*			res = NULL ;							      // Function result
+	File			     root ;									    // Work directory
+	File			     file ;									    // File in work directory
+	struct dirent* dent ;									    // Directory entry structure
+	uint16_t		   i = 0 ;									  // Sequence nr found
+	static char		 lstr[50] ;								  // Space for formatted string
+	char*			     res = NULL ;							  // Function result
 
 	root = SD.open ( "/" ) ;
 	if ( root )
@@ -711,8 +685,13 @@ char* search_sd_dir ( const char* ext, uint16_t seq )
 				i++ ;
 			}
 			file = root.openNextFile() ;
-	   }
+	  }
+    root.close() ;
 	}
+  else
+  {
+    dbgprint ( "SD directory scan fault!" ) ;
+  }
 	return res ;
 }
 
@@ -721,8 +700,8 @@ char* search_sd_dir ( const char* ext, uint16_t seq )
 //									                S H O W _ S D _ D I R										                    *
 //***********************************************************************************************
 // Show files on SD card.																		                                    *
-// Print files like:																			                                      *
 // If extension is "*", files with all extensions are listed.								                  	*
+// Print files like:																			                                      *
 // ps8-focal71-teco-omsi.tu56																	                                  *
 // os8v3d2-2.tu56																				                                        *
 //***********************************************************************************************
@@ -737,7 +716,7 @@ void show_sd_dir ( const char* ext )
 		row = ( fseq % 15 ) + 16 ;						        // Row for text
 		col = ( fseq / 15 ) * 40 ;						        // Column for text
 		str_put ( "\e[%d;%df"							            // Got cursor position
-				  "%s\e[K\r\n", row, col, p ) ;			      // Show filename, clear to EOL
+				  "%s\e[K\r\n", row, col, p + 1 ) ;       // Show filename, clear to EOL
 		fseq++ ;										                  // Search next filename
 	}
 }
@@ -929,7 +908,7 @@ bool load_sd ( uint16_t sel, const char* filename )
 	char*		    ext ;										            // Extension of filename
 	uint16_t	  size ;										          // Size of device in blocks
 	FILE*		    f ;											            // File handle
-	static char	fspec[100] ;								        // Full filespec
+	static char	fspec[80] ;								          // Full filespec
 	uint16_t	  length = 0 ;								        // Length of the file in blocks
 	int			    n ;											            // Result fread
 	uint16_t	  bcnt;										            // Block number on disk/tape partition
@@ -948,12 +927,12 @@ bool load_sd ( uint16_t sel, const char* filename )
 	}
 	if ( strstr ( filename, ext ) == NULL )					// Check extension
 	{
-		sprintf ( fspec, "/%s%s\r\n",
-				  filename, ext ) ;							          // Form full filespec, with extaension added
+		sprintf ( fspec, "/sd/%s%s\r\n",              // No extension, add default for current device
+				      filename, ext ) ;							      // Form full filespec, with extaension added
 	}
 	else
 	{
-		sprintf ( fspec, "/%s\r\n", filename ) ;			// Form full filespec
+		sprintf ( fspec, "/sd/%s\r\n", filename ) ;		// Full filespec given, use it including extension
 	}
 	str_put ( "Open %s", fspec ) ;							    // Show to user
 	f = fopen ( fspec, "rb" ) ;								      // Open file for read
@@ -985,7 +964,7 @@ bool load_sd ( uint16_t sel, const char* filename )
 		goto END ;											              // Quit
 	}
 	str_put ( "Copying %d blocks from SD to %s. "
-			  "This may take about %d seconds...\r\n",
+			      "This may take about %d seconds...\r\n",
 			  size, devicesx[sel].devname, size / 60 ) ;
 	for ( bcnt = 0 ; bcnt < size ; bcnt++ )					// Copy whole file or half of file
 	{
@@ -993,13 +972,13 @@ bool load_sd ( uint16_t sel, const char* filename )
 		if ( istape )
 		{
 			n = fread ( wrdbuf,
-						sizeof(uint16_t), 128, f ) +		      // Read 128 words from dectape block
-				fread ( &dumwrd,
-						sizeof(uint16_t), 1,   f ) +		      // Read unused word
-				fread ( wrdbuf + 128,
-						sizeof(uint16_t), 128, f ) +		      // Read 128 words from dectape block
-				fread ( &dumwrd,
-						sizeof(uint16_t), 1,   f ) - 2 ;	    // Read unused word, compensate for dummies
+						      sizeof(uint16_t), 128, f ) +    // Read 128 words from dectape block
+			    fread ( &dumwrd,
+				  		   sizeof(uint16_t), 1,   f ) +		  // Read unused word
+			    fread ( wrdbuf + 128,
+						      sizeof(uint16_t), 128, f ) +		// Read 128 words from dectape block
+			    fread ( &dumwrd,
+						      sizeof(uint16_t), 1, f ) - 2 ;  // Read unused word, compensate for dummies
 		}
 		else
 		{
@@ -1038,7 +1017,7 @@ END:
 //***********************************************************************************************
 void clp()
 {
-	str_put ( "\e[17;0f\e[J" ) ;					  // Cursur to dump position, clear to EOS
+	str_put ( "\e[16;0f\e[J" ) ;					  // Cursur to dump position, clear to EOS
 }
 
 
@@ -1065,97 +1044,115 @@ bool tcmd ( const char* command, const char* pattern )
 
 
 //***********************************************************************************************
+//										              M E N U _ S T A T U S 								                      *
+//***********************************************************************************************
+// Show PDP8 status.                                                                            *
+//***********************************************************************************************
+void menu_status()
+{
+  str_put ( "\e[16;0f" ) ;							        // Cursor to status position
+  str_put ( "\e[32m") ;								          // Green
+  str_put ( "PC %o:%04o  -  DF %o  -  "				  // Show machine status
+        "AC %o:%04o  -  MQ %04o  -  "
+        "MB %04o  -  SR %04o",
+        IF, PC - 1, DF, AC >> 12, AC & 07777,
+        MQ, MEM[IF][PC-1], SR ) ;
+  str_put ( "\e[37m") ;								          // White
+}
+
+
+//***********************************************************************************************
 //									                  E X _ M N U _ C M D											                  *
 //***********************************************************************************************
 // Execute a menu command.																		                                  *
 // Examples:																					                                          *
-// CO				- Continue at current location.												                              *
-// CO 200			- Continue at 0200 in the current IF.										                          *
-// CO 1 2200		- Continue at 2200 in IF 1.													                            *
-// ST				- Start at 7605 in IF/DF 0 (AC and link set to zero). Starts OS/8.			            *
-// ST 1 2200		- Start at 2200 in IF/DF 1 (AC and link set to zero).						                *
+// CO				      - Continue at current location.												                        *
+// CO 200			    - Continue at 0200 in the current IF.										                      *
+// CO 1 2200		  - Continue at 2200 in IF 1.													                          *
+// ST				      - Start at 7605 in IF/DF 0 (AC and link set to zero). Starts OS/8.		        *
+// ST 1 2200		  - Start at 2200 in IF/DF 1 (AC and link set to zero).						              *
 // LD os8v3.rk05	- Load rk05 image (RKA0 and RKB0) from SD card.								                *
-// DU 5 1000		- Dump a page from location 1000 in field 5.								                    *
-// DU				- Dump next page.															                                      *
+// DU 5 1000		  - Dump a page from location 1000 in field 5.								                  *
+// DU				      - Dump next page.															                                *
 //***********************************************************************************************
 void ex_mnu_cmd ( const char *cmd )
 {
-	unsigned int	ui ;									// For sscanf
-	static uint16_t	dumpdf = 0 ;							// Default dump DF
-	static uint16_t	dumpaddr = 0200 ;						// Default dump address
-	const char*		p ;										// Points into cmd
-	const char*		pa = NULL ;								// Alfanumerical parameter 1
-	int16_t			p1 = -1 ;								// Numerical parameters 1 in command
-	int16_t			p2 = -1 ;								// Numerical parameters 1 in command
-	const char*		dvnam ;									// Points to device name in devices
+	unsigned int	  ui ;									            // For sscanf
+	static uint16_t	dumpdf = 0 ;							        // Default dump DF
+	static uint16_t	dumpaddr = 0200 ;						      // Default dump address
+	const char*		  p ;										            // Points into cmd
+	const char*		  pa = NULL ;								        // Alfanumerical parameter 1
+	int16_t			    p1 = -1 ;								          // Numerical parameters 1 in command
+	int16_t			    p2 = -1 ;								          // Numerical parameters 1 in command
+	const char*		  dvnam ;									          // Points to device name in devices
 
-	p = strstr ( cmd, " " ) ;  								// Parameter 1 supplied?
-	if ( ( p != NULL && ( strlen(p) > 1 ) ) )				// Reasonable parameter?
+	p = strstr ( cmd, " " ) ;  								        // Parameter 1 supplied?
+	if ( ( p != NULL && ( strlen(p) > 1 ) ) )				  // Reasonable parameter?
 	{
-		pa = p + 1 ;										// Move beyond space
-		if ( sscanf ( pa, "%o", &ui ) == 1 )				// Get p1
+		pa = p + 1 ;										                // Move beyond space
+		if ( sscanf ( pa, "%o", &ui ) == 1 )				    // Get p1
 		{
 			p1 = ui ;
-			p = strstr ( p + 2, " " ) ;						// Parameter 2 supplied?
-			if ( ( p != NULL && ( strlen(p) > 1 ) ) )		// Reasonable parameter?
+			p = strstr ( p + 2, " " ) ;						        // Parameter 2 supplied?
+			if ( ( p != NULL && ( strlen(p) > 1 ) ) )		  // Reasonable parameter?
 			{
-				if ( sscanf ( p, "%o", &ui ) == 1 )			// Get p2
+				if ( sscanf ( p, "%o", &ui ) == 1 )			    // Get p2
 				{
 					p2 = ui ;
 				}
 			}
 		}
 	}
-	clp() ;													// Clear lower part of screen
-	if ( tcmd ( cmd, "CO" ) )								// Continue command?
+	clp() ;													                  // Clear lower part of screen
+	if ( tcmd ( cmd, "CO" ) )								          // Continue command?
 	{
-		running = true ;									// Restart interpreter
+		running = true ;									              // Restart interpreter
 	}
-	else if ( tcmd ( cmd, "DU" ) )							// Dump command?
+	else if ( tcmd ( cmd, "DU" ) )							      // Dump command?
 	{
 		if ( p2 >= 0 )
 		{
-			dumpdf = p1 ;									// New DF
-			dumpaddr = p2 ;									// And address
+			dumpdf = p1 ;									                // New DF
+			dumpaddr = p2 ;									              // And address
 		}
-		else if ( p1 >= 0 )									// Address only specified?
+		else if ( p1 >= 0 )									            // Address only specified?
 		{
-			dumpaddr = p1 ;									// New address
+			dumpaddr = p1 ;									              // New address
 		}
-		dump ( dumpdf, dumpaddr ) ;							// Dump 128 words
-		dumpaddr = ( dumpaddr+0200 ) & 07777 ;				// Default next 128 words
+		dump ( dumpdf, dumpaddr ) ;							        // Dump 128 words
+		dumpaddr = ( dumpaddr+0200 ) & 07777 ;				  // Default next 128 words
 	}
-	else if ( tcmd ( cmd, "BO" )  )							// Boot command?
+	else if ( tcmd ( cmd, "BO" )  )							      // Boot command?
 	{
-		boot() ;											// Yes, GO.  Will set running to true
+		boot() ;											                  // Yes, GO.  Will set running to true
 	}
-	else if ( tcmd ( cmd, "ST" ) )							// Start at 7605 command
+	else if ( tcmd ( cmd, "ST" ) )							      // Start at 7605 command
 	{
-		AC = 0 ;											// Clear AC and link
-		if ( p2 >= 0 )										// 2 parameters?
+		AC = 0 ;											                  // Clear AC and link
+		if ( p2 >= 0 )										              // 2 parameters?
 		{
-			IF = DF = p1 ;									// Yes, set IF and DF
+			IF = DF = p1 ;									              // Yes, set IF and DF
 			PC = p2 ;
 		}
-		else if ( p1 >= 0 )									// At least 1 parameter
+		else if ( p1 >= 0 )									            // At least 1 parameter
 		{
-			PC = p1 ;										// Set PC
+			PC = p1 ;										                  // Set PC
 		}
 		else
 		{
-			PC = 07605 ;									// Continue at 7605
-			IFpending = IF = DF = 0 ;						// DF and IF to 0
+			PC = 07605 ;									                // Continue at 7605
+			IFpending = IF = DF = 0 ;						          // DF and IF to 0
 		}
 		running = true ;
 	}
-	else if ( tcmd ( cmd, "SL" ) )							// Select device for LD/SV?
+	else if ( tcmd ( cmd, "SL" ) )							      // Select device for LD/SV?
 	{
 		if ( p1 >= 0 )
 		{
-			if ( p1 < NUMDEV )								      // Check parameter, user uses 0..5
+			if ( p1 < NUMDEV )								            // Check parameter, user uses 0..5
 			{
-				seldev = p1 ;								          // Set new selected device
-				menu_state = START ;						      // Show in refreshed menu
+				seldev = p1 ;								                // Set new selected device
+				menu_state = START ;						            // Show in refreshed menu
 			}
 			else
 			{
@@ -1206,9 +1203,9 @@ void ex_mnu_cmd ( const char *cmd )
 	{
 		if ( p1 >= 0 )
 		{
-			SR= p1 ;
+			SR = p1 ;
 		}
-    menu_status() ;                                 // Show new status
+    menu_status() ;                            			// Show new status
 	}
 	else if ( tcmd ( cmd, "PO" ) )							      // Power-off
 	{
@@ -1287,26 +1284,6 @@ void ex_mnu_cmd ( const char *cmd )
 
 
 //***********************************************************************************************
-//										              M E N U _ S T A T U S 								                      *
-//***********************************************************************************************
-// Show PDP8 status.                                                                            *
-//***********************************************************************************************
-void menu_status()
-{
-  str_put ( "\e[s" ) ;								          // Save cursor
-  str_put ( "\e[16;0f" ) ;							        // Cursor to status position
-  str_put ( "\e[32m") ;								          // Green
-  str_put ( "PC %o:%04o  -  DF %o  -  "				  // Show machine status
-        "AC %o:%04o  -  MQ %04o  -  "
-        "MB %04o  -  SR %04o",
-        IF, PC - 1, DF, AC >> 12, AC & 07777,
-        MQ, MEM[IF][PC-1], SR ) ;
-  str_put ( "\e[37m") ;								          // White
-  str_put ( "\e[u" ) ;								          // Unsave cursor
-}
-
-
-//***********************************************************************************************
 //										                    M E N U													                      *
 //***********************************************************************************************
 // Handle the menu.																				                                      *
@@ -1355,7 +1332,8 @@ void menu()
 	if ( menu_state == START )								      // Have to display the menu?
 	{
 		str_put ( menutxt ) ;								          // Send to telnet client
-    menu_status() ;                               // Shpw status
+		str_put ( "\e[s" ) ;								          // Save cursor
+    menu_status() ;                               // Show status
 		str_put ( "\e[33m") ;								          // Yellow
 		str_put ( "\e[1;42f"								          // Position for current LD/SV device
 		          "Current LD/SV device is %s",
@@ -1368,6 +1346,11 @@ void menu()
 		str_put ( "\e[u" ) ;								          // Unsave cursor
 		menu_state = WAIT_CMD ;								        // Start waiting for command
 		inx = 0 ;											                // Put characters at the beginning
+    while ( kbd_available() )                     // Clear stray input
+    {
+      kbd_get() ;
+      delay ( 10 ) ;
+    }
 	}
 	if ( menu_state == WAIT_CMD )							      // Waiting for user input?
 	{
@@ -1428,21 +1411,24 @@ void welcome()
 	const char*	 msg =	"\e[2J\e[H"										              // Erase screen, cursor home
 						          "Welcome to PDP8 simulator running OS/8\r\n"
 						          "Written by Ed Smallenburg\r\n\n" ;
-	char	       buf ;
-	int16_t      n = 0 ;
+	char	       buf[16] ;
 
 	menu_state = IDLE ;										                  // Disable menu
-	while ( n > 0 )
-	{
-		vTaskDelay ( 10 / portTICK_PERIOD_MS ) ;
-		n = clientRecv ( &buf, 1 ) ;              		        // Skip all garbage input
-	}
 	str_put ( msg ) ;											                  // Sent to telnet client
 	if ( card_okay )											                  // SD card found?
 	{
 		str_put ( "SD card found on this system.\r\n\n" ) ;		// Yes, show!
 	}
 	str_put ( "\nPress any key to continue... " ) ;
+	vTaskDelay ( 500 / portTICK_PERIOD_MS ) ;
+	while ( clientRecv ( buf, sizeof(buf) ) > 0 )           // Skip all garbage input
+	{
+		vTaskDelay ( 20 / portTICK_PERIOD_MS ) ;
+  }
+  while ( kbd_available() )								                // Any input?
+  {
+    kbd_get() ;										                        // Yes, read char and discard
+  }
 	menu_state = WAIT_ANY ;										              // Wait for a key
 }
 
@@ -1454,7 +1440,7 @@ void welcome()
 // Once a client has connected, we then read until there is no more data.						            *
 // We then close the client socket and start waiting for a new connection.						          *
 //***********************************************************************************************
-void telnetTask ( void *pvParameter )
+void telnetTask ( void* pvParameter )
 {
 	struct sockaddr_in	clientAddress ;
 	struct sockaddr_in	serverAddress ;
@@ -1462,6 +1448,7 @@ void telnetTask ( void *pvParameter )
 	int					        sock ;							  	            // Socket for listen
 	int					        rc ;								                // Result of bind/listen
 
+  delay ( 4000 ) ; dbgprint ( "telnetTask started" ) ;
 	sock = socket ( AF_INET, SOCK_STREAM, IPPROTO_TCP ) ;		// Create socket for listen
 	if ( sock < 0 )												                  // Check result
 	{
@@ -1502,8 +1489,7 @@ void telnetTask ( void *pvParameter )
 			goto END;
 		}
 		dbgprint ( "New client connected" ) ;					        // We now have a new client ...
-		welcome() ;												                    // Display welcome message
-		while ( clientSock >= 0 )
+		while ( ( telnetConnected = ( clientSock >= 0 ) ) )
 		{
       vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;           // Just pause
     }
@@ -1520,86 +1506,80 @@ void telnetTask ( void *pvParameter )
 
 
 //***********************************************************************************************
-//								                    U S E R T A S K    			                      						*
+//								                    U S E R L O O P   			                      						*
 //***********************************************************************************************
 // Handle user commands for the menu and user input/output for TTY.  							              *
 // Input from TelNet or serial port.                                                            *
 //***********************************************************************************************
-void userTask ( void *pvParameter )
+void userLoop()
 {
-	char				        c ;									               	// Char buffer for in/output
-	int					        n ;										              // Nr of chars read from socket
-	bool				        idle ;									            // True if no activity
-  static bool         once = true ;                       // Welcome text just once
+	char				        c ;									             	// Char buffer for in/output
+	int					        n ;										            // Nr of chars read from socket
+	bool				        idle ;									          // True if no activity
+  static bool         once = true ;                     // Welcome text just once
+  static bool         old_telnetConnected = false ;
 
-  vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;				      // Give some time before start
-	while ( !abortf )  											                // Listen for a command
-	{
-		lc_user++ ;											                      // Count number of loops
-    idle = true ;										                      // Assume no activity
-    if ( uxQueueSpacesAvailable ( kbd_queue ) )			      // Do we have space for keystrokes?
+  lc_user++ ;											                      // Count number of loops
+  idle = true ;										                      // Assume no activity
+  if ( uxQueueSpacesAvailable ( kbd_queue ) )			      // Do we have space for keystrokes?
+  {
+    if ( telnetConnected && ( ! old_telnetConnected ) )
     {
-      n = clientRecv ( &c, 1 ) ;						              // Read 1 character from client, no blocking
-      if ( n > 0 )									                      // Any input?
-      {
-        idle = false ;								                    // Activity detected
-        if ( c == ( 'A' & 0x3F ) )  				              // Ctrl-A ?
-        {
-          running = false ;						                    // Stop PDP8
-          if ( once )                                     // Yes, welcome text?
-          {
-         		welcome() ;											              // Yes, display welcome message
-            once = false ;
-          }
-          else
-          {
-            menu_state = START ;				                  // Force start of menu
-          }
-          if ( clientSock < 0 )                           // Input from serial?
-          {
-            DEBUG = false ;   	                          // Yes, stop debug output
-          }
-          dbgprint ( "Ctrl-A seen" ) ;
-        }
-        else if ( c )								                      // Skip NULL character
-        {
-          xQueueSend ( kbd_queue, &c, 0 ) ;		            // Send to keyboard queue
-        }
-      }
+      c = 'A' & 0x3F ;                                  // Yes, simulate Ctrl-A
+      n = 1 ;
+      once = true ;                                     // Allow welcome screen
+      dbgprint ( "Force Ctrl-A" ) ;
     }
     else
     {
-      dbgprint ( "Keyboard queue full" ) ;
+      n = clientRecv ( &c, 1 ) ;                        // Read 1 character from client, no blocking
     }
-    if ( uxQueueMessagesWaiting ( tls_queue ) )			      // Something to send?
+    old_telnetConnected = telnetConnected ;             // Remember current state
+    if ( n > 0 )									                      // Any input?
     {
-      xQueueReceive ( tls_queue, &c, 0 ) ;			          // Yes, get next char
-      clientSend ( &c, 1 ) ;                    		      // Sent to user
-      idle = false ;									                    // State is not idle
-    }
-    if ( idle )											                      // Nothing to do, wait some time
-    {
-      vTaskDelay ( 10 / portTICK_PERIOD_MS ) ;		        // Sleep some time
-    }
-    if ( !running )
-    {
-      menu() ;										                        // Handle menu
+      idle = false ;								                    // Activity detected
+      if ( c == ( 'A' & 0x3F ) )  				              // Ctrl-A ?
+      {
+        dbgprint ( "Ctrl-A seen" ) ;
+        running = false ;						                    // Stop PDP8
+        if ( once )                                     // Yes, welcome text?
+        {
+          welcome() ;                                   // Yes, display welcome message
+          once = false ;
+        }
+        else
+        {
+          menu_state = START ;				                  // Force start of menu
+        }
+        if ( clientSock < 0 )                           // Input from serial?
+        {
+          DEBUG = false ;   	                          // Yes, stop debug output
+        }
+      }
+      else if ( c )								                      // Skip NULL character
+      {
+        xQueueSend ( kbd_queue, &c, 0 ) ;		            // Send to keyboard queue
+      }
     }
   }
-	vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;				      // Give some time at power off
-	vQueueDelete ( kbd_queue ) ;								            // Clean-up the queues
-	vQueueDelete ( tls_queue ) ;
-	#ifdef OLEDDISPLAY
-		vTaskDelete ( th_console ) ;							            // End of display task (if any)
-	#endif
-	dbgprint ( "Stopping CPU, go to sleep" ) ;
-	#ifdef OLEDDISPLAY
-		display->clear() ;										                // Clear the display
-    #endif
-	vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;					      // Give some time to clear
-	//esp_deep_sleep_start() ;									            // and go to sleep
-	// Will not return here...
-	//vTaskDelete ( NULL ) ;									              // End of task
+  else
+  {
+    dbgprint ( "Keyboard queue full" ) ;
+  }
+  if ( uxQueueMessagesWaiting ( tls_queue ) )			      // Something to send?
+  {
+    xQueueReceive ( tls_queue, &c, 0 ) ;			          // Yes, get next char
+    clientSend ( &c, 1 ) ;                    		      // Sent to user
+    idle = false ;									                    // State is not idle
+  }
+  if ( idle )											                      // Nothing to do, wait some time
+  {
+    vTaskDelay ( 10 / portTICK_PERIOD_MS ) ;		        // Sleep some time
+  }
+  if ( !running )
+  {
+    menu() ;										                        // Handle menu
+  }
 }
 
 
@@ -1609,32 +1589,26 @@ void userTask ( void *pvParameter )
 //***********************************************************************************************
 // Task to simulate the console ligths on the OLED.												                      *
 //***********************************************************************************************
-void consoleTask ( void *pvParameter )
+void consoleTask ( void* pvParameter )
 {
-	bool once = true ;												        // Start with complete refresh
-
-	dbgprint ( "console task started" ) ;
-  display = new OLED ( "SSD" ) ;									  // Create SSD1306 instance
-	display->clear() ;												        // Clear and init screen
+  display = new OLED ( "SSD", SDA_PIN, SCL_PIN ) ;        // Create SSD1306 instance
+	display->clear() ;												              // Clear and init screen
+  display->setmarkers ( 0, 0777777 ) ;					          // Markers for DF, IF and PC
+  display->setmarkers ( 1,   07777 ) ;					          // Markers for MA
+  display->setmarkers ( 2,   07777 ) ;					          // Markers for MB
+  display->setmarkers ( 3,  017777 ) ;					          // Markers for L and AC
+  display->setmarkers ( 4,   07777 ) ;					          // Markers for MQ
   while ( true )
 	{
-		vTaskDelay ( 20 / portTICK_PERIOD_MS ) ;				// Sleep for 20 milliseconds
-		if ( once )												              // Draw markers?
-		{															                  // Yes
-			display->setmarkers ( 0, 0777777 ) ;					// Markers for DF, IF and PC
-			display->setmarkers ( 1,   07777 ) ;					// Markers for MA
-			display->setmarkers ( 2,   07777 ) ;					// Markers for MB
-			display->setmarkers ( 3,  017777 ) ;					// Markers for L and AC
-			display->setmarkers ( 4,   07777 ) ;					// Markers for MQ
-		}
-		display->show_register ( 0, 0777777, 						// DF, IF and PC
+		vTaskDelay ( 20 / portTICK_PERIOD_MS ) ;				      // Sleep for 20 milliseconds
+		display->show_register ( 0, 0777777, 						      // DF, IF and PC
 	                           DF << 15 | IF << 12 | PC ) ;
-		display->show_register ( 1,   07777, MA ) ;			// MA
-		display->show_register ( 2,   07777, MB ) ;			// MB
-		display->show_register ( 3,  017777, AC ) ;			// L and AC
-		display->show_register ( 4,   07777, MQ ) ;			// MQ
-		display->display ( once ) ;		    						  // Show it
-		once = false ;												          // Limit refresh after first run
+		display->show_register ( 1,   07777, MA ) ;			      // MA
+		display->show_register ( 2,   07777, MB ) ;			      // MB
+		display->show_register ( 3,  017777, AC ) ;			      // L and AC
+		display->show_register ( 4,   07777, MQ ) ;			      // MQ
+		display->display() ;        		   						        // Show it
+    lc_console++ ;                                        // Count loops
 	}
 }
 #endif
@@ -1733,7 +1707,7 @@ static void obtain_time ( void )
 		timeinfo.tm_year = 2023 - 1900 ;					            // Use default date
 		timeinfo.tm_mon  = 6 - 1 ;							              // 01-JUN-2023
 		timeinfo.tm_mday = 1 ;
-    	timeinfo.tm_hour = 12 ;                             // !2:00:00
+    timeinfo.tm_hour = 12 ;                               // !2:00:00
 		timeinfo.tm_min = 0 ;
 		timeinfo.tm_sec = 0 ;
 		dbgprint ( "System time NOT set, "
@@ -2621,20 +2595,26 @@ void interp ( int n )
 // Task to simulate the PDP8 processor.															                            *
 // Most of the job is dome by "interp()".														                            *
 //***********************************************************************************************
-void pdp8Task ( void *pvParameter )
+void pdp8Task ( void* pvParameter )
 {
 	vTaskDelay ( 2000 / portTICK_PERIOD_MS ) ;				// Sleep some time
-	obtain_time() ;											              // Get current time
+  obtain_time() ;                                   // Get current time
 	while ( true )
 	{
-		lc_sim++ ;											                // Count number of loops
-		interp ( 200 ) ;									              // Emulate next 200 instruction
+    if ( running )                                  // PDP8 running?
+    {
+      lc_sim++ ;											              // Yes, count number of loops
+		  interp ( 200 ) ;									            // Emulate next 200 instruction
+    }
+    else
+    {
+      vTaskDelay ( 20 / portTICK_PERIOD_MS ) ;			// Not running, sleep some time
+    }
 		if ( flushrequest )									            // Request to flush?
 		{
 			flushcache() ;									              // Yes, do it
 			flushrequest = false ;							          // Clear request
 		}
-    //		yield() ;									                // Allow others
 	}
 }
 
@@ -2661,10 +2641,10 @@ void stackDump()
 			   pcTaskGetTaskName ( th_sim ),					          // for simulator task
 			   uxTaskGetStackHighWaterMark ( th_sim ),
 			   lc_sim ) ;
-	dbgprint ( nstr,											                  // Stack usage, loop count
-			   pcTaskGetTaskName ( th_user ),					          // for user task
-			   uxTaskGetStackHighWaterMark ( th_user ),
-			   lc_user ) ;
+	// dbgprint ( nstr,											                  // Stack usage, loop count
+	// 		   pcTaskGetTaskName ( th_user ),					          // for user task
+	// 		   uxTaskGetStackHighWaterMark ( th_user ),
+	// 		   lc_user ) ;
 	#ifdef OLEDDISPLAY
 		dbgprint ( nstr,										                  // Stack usage, loop count
 				   pcTaskGetTaskName ( th_console ),			        // for console task
@@ -2684,79 +2664,72 @@ void stackDump()
 //***********************************************************************************************
 void setup()
 {
-	uint16_t		flushcount = 0 ;						          // Timer for flushing cache
-	esp_err_t		ret ;									                // Result card mount
-	uint8_t			wake_up_pin = 0 ;						          // Pin 0 used for wake-up
-	dcache_t*		p ;										                // Pointer to allocated cache space
+	uint16_t		flushcount = 0 ;						              // Timer for flushing cache
+	esp_err_t		ret ;									                    // Result card mount
+	uint8_t			wake_up_pin = 0 ;						              // Pin 0 used for wake-up
+	dcache_t*		p ;										                    // Pointer to allocated cache space
 
-	Serial.begin ( 115200 ) ;								          // Init serial output
-  delay ( 3000 ) ;										              // Start delay
+	Serial.begin ( 115200 ) ;								              // Init serial output
+  delay ( 3000 ) ;										                  // Start delay
 	Serial.println() ;
-  dbgsem  = xSemaphoreCreateMutex() ;						    // Semaphore for exclusive use of dbgprint
+  dbgsem  = xSemaphoreCreateMutex() ;						        // Semaphore for exclusive use of dbgprint
   #ifdef OTA
-    ota_enabled = true ;                            // Enable OTA if defined
+    ota_enabled = true ;                                // Enable OTA if defined
   #endif
-	//esp_sleep_pd_config ( ESP_PD_DOMAIN_RTC_PERIPH,	// Init deep-sleep mode
+	//esp_sleep_pd_config ( ESP_PD_DOMAIN_RTC_PERIPH,	    // Init deep-sleep mode
 	//					  ESP_PD_OPTION_AUTO ) ;
 	//esp_sleep_enable_ext0_wakeup ( (gpio_num_t)wake_up_pin,	// Wake if GPIO is low
 	//							   0 ) ;		
-	pinMode ( wake_up_pin, INPUT_PULLUP ) ;					  // Use pull-up on GPIO 0 (wake-up)
-	pinMode ( SD_CS, OUTPUT ) ;								        // CS pin for SD card is output
+	pinMode ( wake_up_pin, INPUT_PULLUP ) ;					      // Use pull-up on GPIO 0 (wake-up)
+	pinMode ( SD_CS, OUTPUT ) ;								            // CS pin for SD card is output
 	if ( RST_PIN >= 0 )
 	{
-	  pinMode ( RST_PIN, OUTPUT ) ;							      // Reset pin for OLED is output
+	  pinMode ( RST_PIN, OUTPUT ) ;							          // Reset pin for OLED is output
 	  digitalWrite ( RST_PIN, HIGH ) ;						        // Reset pin for OLED must be HIGH
 	}
 	dbgprint ( "Starting PDP8 simulator on ESP32..." ) ;
 	dbgprint ( "Flash size is %d MB", 						        // Show flash size
 	           ESP.getFlashChipSize() / 1048576 ) ;
-    Wire.begin ( SDA_PIN, SCL_PIN, (uint32_t)400000 ) ;	// For possible display
-	i2cScan() ;												// TEST*TEST*TEST
 	SPI.begin ( SD_SCK, SD_MISO, SD_MOSI, SD_CS ) ;
-	card_okay = SD.begin ( SD_CS, SPI, 4000000 ) ;		    // Check SD mount result
+	card_okay = SD.begin ( SD_CS, SPI, SDSPEED,		        // Check SD mount result
+                         "/sd", 3 ) ;
 	if ( !card_okay )
 	{
-		if ( ret == ESP_FAIL )
-		{
-			dbgprint ( "Failed to mount filesystem!" ) ;
-		}
-		else
-		{
-			dbgprint ( "Failed to initialize SD card (%d).", ret ) ;
-		}
+    dbgprint ( "Failed to mount SD card!" ) ;
 	}
 	else
   {
     card_okay = ( SD.cardType() != CARD_NONE ) ;        // See if known card
     if ( ! card_okay )
     {
-      dbgprint ( "No SD card attached" ) ;              // Card not readable
+      dbgprint ( "No known SD card attached" ) ;        // Card not readable
+    }
+    else
+    {
+      dbgprint ( "SD card detected" ) ;
     }
   }
-  if ( ota_enabled )                                    // OTA configured?
+	initialize_wifi() ;										                // Initialize WiFi
+  if ( ota_enabled )
   {
-    if ( ! esp_partition_find (                         // Get partition iterator for
+    if ( esp_partition_find (                           // Get partition iterator for
                   ESP_PARTITION_TYPE_APP,               // OTA partition
                   ESP_PARTITION_SUBTYPE_APP_OTA_0,
                   NULL  ) )
     {
+      ArduinoOTA.setHostname ( NAME ) ;						      // Set the hostname
+      ArduinoOTA.begin() ;									            // Allow update over the air
+    }
+    else
+    {
       ota_enabled = false ;                             // No OTA partition, disable OTA handling
     }
   }
-	initialize_wifi() ;										                // Initialize WiFi
-	if ( ota_enabled )
-  {
-    ArduinoOTA.setHostname ( NAME ) ;						        // Set the hostname
-    ArduinoOTA.begin() ;									              // Allow update over the air
-  }
 	for ( int i = 0 ; i < NUMDEV ; i++ )					        // Mount all device partitions
 	{
-	  dvmount ( &devicesx[i].handle, devicesx[i].devname,
-			  	devicesx[i].size ) ;
-	}
-	if ( card_okay )
-	{
-		dbgprint ( "SD card found, ready for use" ) ;
+	  dvmount ( &devicesx[i].handle,
+              devicesx[i].devname,
+			  	    devicesx[i].size ) ;
 	}
 	for ( int i = 0 ; i < CACHESIZE ; i++ )
 	{
@@ -2764,7 +2737,7 @@ void setup()
 		dcache[i] = p ;										                  // Save pointer to buffer
 		dcache[i]->handle = ILLHANDLE ;						          // Set handle to unused
 	}
-	for ( int i = 0 ; i < 8 ; i++ )
+	for ( int i = 0 ; i < MEMBLOCKS ; i++ )
 	{
 		for ( int j = 0 ; j < 4096 ; j++ )
 		{
@@ -2772,10 +2745,9 @@ void setup()
 		}
 	}
 	dbgprint ( "Starting PDP8 Emulator task "
-			   "and telnet server" ) ;
- 	kbd_queue = xQueueCreate( 512, sizeof(uint8_t) ) ;	  // Init 2 queues
-	tls_queue = xQueueCreate( 512, sizeof(uint8_t) ) ;	  // for input and output
-
+			       "and telnet server" ) ;
+ 	kbd_queue = xQueueCreate( 256, sizeof(uint8_t) ) ;	  // Init 2 queues
+	tls_queue = xQueueCreate( 256, sizeof(uint8_t) ) ;	  // for input and output
 	xTaskCreatePinnedToCore (								              // Create task
 		pdp8Task, 											                    // Task module.
 		"PDP8Task",										                      // Name of task.
@@ -2791,14 +2763,6 @@ void setup()
 		NULL,												                        // No parameters
 		3,													                        // priority
 		&th_telnet,											                    // Task handle
-		0 ) ;												                        // Run on CPU 0
-	xTaskCreatePinnedToCore (								              // Create task
-		userTask,   										                    // Task module.
-		"userTask",   									                    // Name of task.
-		2200,												                        // Stack size of task
-		NULL,												                        // No parameters
-		3,													                        // priority
-		&th_user, 											                    // Task handle
 		0 ) ;												                        // Run on CPU 0
 	#ifdef OLEDDISPLAY
 		xTaskCreatePinnedToCore (							              // Create task
@@ -2823,47 +2787,61 @@ void loop()
 {
 	static uint32_t lasttim = 0 ;
 	uint32_t        newtim ;
-	static uint16_t	show_stack = 59 ;					// Counter for showing stack space
-	static uint16_t flushcount = 0 ;					// Timer for flushing cache
+	static uint16_t	show_stack = 59 ;					    // Counter for showing stack space
+	static uint16_t flushcount = 0 ;					    // Timer for flushing cache
 
-  newtim = millis() ;									      // Get current time
-	lc_main++ ;											          // Count number of loops
+  userLoop() ;                                  // Handle user (keyboard/telnet) input
+  newtim = millis() ;									          // Get current time
+	lc_main++ ;											              // Count number of loops
 	if ( ota_enabled )
   {
-      ArduinoOTA.handle() ;							    // Check for OTA actions
+      ArduinoOTA.handle() ;							        // Check for OTA actions
   }
-	if ( newtim < ( lasttim + 10000 ) )				// 10 seconds passed?
+	if ( newtim > ( lasttim + 10000 ) )				    // 10 seconds passed?
 	{
-		return ;										            // No, quick return
-	}
-	// 10 seconds has passed
-	lasttim = newtim ;
-	if ( ++show_stack == 60 )							    // Time to show stacks every 5 minutes?
-	{
-    stackDump() ;    									      // Yes, show memory usage
-		show_stack = 0 ;								        // Reset counter
-	}
-	if ( instcount )
-	{
-		dbgprint ( "Number of instructions processed:  %d/sec, "
-				       "PC is %o:%04o",
-				       instcount/ 10, IF, PC ) ;
-		instcount = 0 ;									        // Reset instruction counter
-	}
-	if ( flushcount++ >= 30 )							    // Time to flush the cache buffers?
-	{
-		flushcount = 0 ;								        // Yes, reset counter
-		flushrequest = true ;							      // Request a flush
-	}
-	if ( ( !apmode ) &&
-	     ( WiFi.status() != WL_CONNECTED ) )
-	{
-		dbgprint ( "Reconnect to WiFi.." ) ;
-		WiFi.reconnect() ;
-	}
-  if ( digitalRead ( 0 ) == LOW )           // Stackdump request?
+	  lasttim = newtim ;                          // Yes
+    if ( ++show_stack == 60 )						        // Time to show stacks every 5 minutes?
+    {
+      stackDump() ;    								          // Yes, show memory usage
+      show_stack = 0 ;							            // Reset counter
+    }
+    if ( instcount )
+    {
+      dbgprint ( "Number of instructions processed:  %d/sec, "
+                "PC is %o:%04o",
+                instcount/ 10, IF, PC ) ;
+      instcount = 0 ;									          // Reset instruction counter
+    }
+    if ( flushcount++ >= 30 )							      // Time to flush the cache buffers?
+    {
+      flushcount = 0 ;								          // Yes, reset counter
+      flushrequest = true ;							        // Request a flush
+    }
+    if ( ( !apmode ) &&
+        ( WiFi.status() != WL_CONNECTED ) )
+    {
+      dbgprint ( "Reconnect to WiFi.." ) ;
+      WiFi.reconnect() ;
+    }
+  }
+  if ( digitalRead ( 0 ) == LOW )               // Stackdump request?
   {
-    delay ( 200 ) ;                         // Yes, debounce
-    stackDump() ;                           // Show stack usage
+    delay ( 200 ) ;                             // Yes, debounce
+    stackDump() ;                               // Show stack usage
+  }
+  if ( abortf )
+  {
+  	vTaskDelay ( 1000 / portTICK_PERIOD_MS ) ;  // Give some time at power off
+    #ifdef OLEDDISPLAY
+    	vTaskDelete ( th_console ) ;						  // End of display task (if any)
+    #endif
+    dbgprint ( "Stopping CPU, go to sleep" ) ;
+    #ifdef OLEDDISPLAY
+    	display->clear() ;										    // Clear the display
+    #endif
+    vTaskDelay ( 100 / portTICK_PERIOD_MS ) ;	  // Give some time to clear
+    esp_deep_sleep_start() ;								    // and go to sleep
+    // Will not return here...
+    //vTaskDelete ( NULL ) ;									  // End of task
   }
 }
